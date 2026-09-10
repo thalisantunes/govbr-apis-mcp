@@ -1,0 +1,113 @@
+# Half-price ticket eligibility (Lei 12.933/2013 + Decreto 8.537/2015).
+# Coverage is uneven by beneficiary: students and ID Jovem have a validation route
+# open to private companies; PcD and teachers have none — see docs/meia-entrada.md.
+apis:
+  - id: meiaentrada-cie-validador
+    name: Validador CIE — Meia Entrada (base DNE)
+    provider: Entidades estudantis nacionais (UNE/UBES/ANPG)
+    category: meia-entrada
+    status: available
+    auth: api_key
+    pii: true
+    auth_config:
+      header: codigoAcesso
+      env: MEIAENTRADA_CODIGO_ACESSO
+      signup_url: https://www.meiaentrada.org.br/validador/integre
+    base_url: https://api-prod.meiaentrada.org.br
+    docs_url: https://www.meiaentrada.org.br/validador/integre
+    description: >-
+      Valida a Carteira de Identificação Estudantil emitida pelas entidades nacionais
+      (base DNE / Documento do Estudante). POST /public/validador com body
+      {codigoUso, dataNascimento (YYYYMMDD), nomeEvento, dataEvento (YYYYMMDD),
+      cnpjPromotor}. Responde sempre HTTP 200 com {status, codigoRetorno, mensagem} e,
+      quando status=true, nome, nomeSocial, cpf, foto/urlFoto, instituicao, curso,
+      nivelEscolaridade, entidade, certificado, municipio e dataExpiracao — dá para
+      conferir titularidade na portaria. Cadastro de estabelecimento/produtora é
+      aberto ao setor privado.
+    tags: [meia-entrada, estudante, cie, eventos, validacao]
+    notes: >-
+      Contrato extraído do front oficial e verificado em 2026-08-07. codigoUso e
+      dataNascimento são exatamente os dois parâmetros da URL do QR code da carteirinha
+      (/validador/:codigoUso/:dataNascimento). Armadilhas: dataNascimento fora de
+      YYYYMMDD devolve HTTP 500; campo errado devolve codigoRetorno=5 "parâmetros
+      inválidos" (não confunda com codigoRetorno=2 "documento inexistente"); `certificado`
+      é campo de RESPOSTA, não de request. Cobre apenas a base DNE — CIE emitida por
+      DCE/entidade estadual tem validador próprio, sem API; prever fallback documental.
+
+  - id: fesn-cie-validador
+    name: Validador CIE - FESN
+    provider: FESN (emissora de CIE fora da base DNE)
+    category: meia-entrada
+    status: available
+    auth: none
+    pii: true
+    base_url: https://validade.fesn.org.br
+    docs_url: https://validade.fesn.org.br/
+    description: >-
+      Valida CIE emitida pela FESN, uma das emissoras fora da base DNE.
+      GET /api/students/usecode/{codigoUso} — sem autenticação e sem data de
+      nascimento. Retorna name, cpf, birth, entity (instituição), course,
+      courseType, validity e photo. HTTP 200 com corpo significa que a carteirinha
+      existe; carteirinha desconhecida não retorna o objeto.
+    tags: [meia-entrada, estudante, cie, eventos, validacao]
+    notes: >-
+      Verificado em 2026-08-07 com carteirinha real (IFRS) que a base DNE não conhece
+      — prova de que "não achou no DNE" nunca pode virar "não tem direito".
+      A API não valida expiração nem titularidade: `validity` vem no corpo mas não é
+      aplicada, e o código de uso sozinho libera a consulta. Ambas as checagens são
+      feitas por nós em `cie.interpret_fesn`.
+
+  - id: idjovem-validacao
+    name: ID Jovem — validação de carteira
+    provider: Secretaria Nacional da Juventude (SNJ)
+    category: meia-entrada
+    status: manual_only
+    auth: none
+    docs_url: https://www.gov.br/pt-br/servicos/validar-a-id-jovem
+    description: >-
+      ID Jovem (15-29 anos, baixa renda no CadÚnico) é validável por instituição
+      privada, mas só por vias manuais: site idjovem.juventude.gov.br/validarcarteira
+      (código da carteira) e app ID Jovem no fluxo "Sou empresário" (cadastro por CNPJ).
+      Não há API REST pública documentada.
+    tags: [meia-entrada, id-jovem, baixa-renda, jovem]
+    notes: >-
+      Caminho para integração sistêmica: pleitear a API conecta-id-jovem junto à SNJ
+      (juventude@presidencia.gov.br) — é a única das 95 do Conecta cuja descrição
+      oficial admite instituições privadas, mediante aprovação caso a caso.
+      O validador web é SPA protegida por WAF; endpoint de backend não confirmado.
+
+  - id: inss-certificado-pcd
+    name: Certificado de Pessoa com Deficiência (Meu INSS)
+    provider: INSS
+    category: meia-entrada
+    status: manual_only
+    auth: none
+    docs_url: https://www.gov.br/inss/pt-br/saiba-mais/seus-direitos/certificado-de-pessoa-com-deficiencia
+    description: >-
+      Único comprovante digital de PcD que o cidadão emite por conta própria (Meu INSS,
+      PDF com QR de autenticidade, validade 90 dias). A conferência é pelo QR do
+      documento apresentado; não existe API nem consulta em lote. Cobre só quem está
+      nas bases BPC ou aposentadoria PcD (LC 142) — subconjunto pequeno do público PcD.
+    tags: [meia-entrada, pcd, deficiencia, documental]
+    notes: >-
+      Não há registro nacional de PcD consultável por empresa privada. O RRPD
+      (conecta-pessoa-com-deficiencia) e o BPC (conecta-beneficio-de-prestacao-continuada-bpc)
+      resolveriam por CPF, mas são restritos a órgãos federais. Carteiras estaduais
+      (CIPTEA e afins) são fragmentadas por UF e sem consulta unificada.
+
+  - id: emec-ies
+    name: e-MEC — Instituições de Educação Superior
+    provider: Ministério da Educação (MEC)
+    category: meia-entrada
+    status: manual_only
+    auth: none
+    docs_url: https://emec.mec.gov.br/
+    description: >-
+      Cadastro oficial de IES e cursos. Serve como validação indireta: conferir se a
+      instituição declarada na CIE existe e está ativa. Não há API REST oficial —
+      consulta web (protegida por WAF) e dataset CSV no dados.gov.br (use a entrada
+      dados-gov-br para buscar o conjunto "Sistema e-MEC"). Nunca contém dados de aluno.
+    tags: [educacao, ies, estudante, validacao-indireta]
+    notes: >-
+      emec.mec.gov.br e dadosabertos.mec.gov.br respondem 403 a cliente não-browser.
+      Existe scraper não-oficial (github.com/pavanad/emec-api), fora do escopo deste MCP.

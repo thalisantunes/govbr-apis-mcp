@@ -1,0 +1,188 @@
+# Free public Brazilian government APIs — callable today, no contract needed.
+# Verified reachable on 2026-08-07 unless noted otherwise.
+apis:
+  - id: ibge-localidades
+    name: IBGE Localidades
+    provider: IBGE
+    category: public
+    status: available
+    auth: none
+    base_url: https://servicodados.ibge.gov.br/api/v1/localidades
+    docs_url: https://servicodados.ibge.gov.br/api/docs/localidades
+    description: >-
+      Municípios, estados, regiões, mesorregiões, microrregiões e distritos do Brasil,
+      com códigos IBGE. Ex.: GET /municipios, /estados/{uf}/municipios.
+    tags: [geografia, municipios, ibge]
+
+  - id: ibge-agregados
+    name: IBGE Agregados (SIDRA)
+    provider: IBGE
+    category: public
+    status: available
+    auth: none
+    base_url: https://servicodados.ibge.gov.br/api/v3/agregados
+    docs_url: https://servicodados.ibge.gov.br/api/docs/agregados?versao=3
+    description: >-
+      Séries estatísticas do IBGE (censos, PNAD, inflação, PIB municipal etc.) via
+      agregados/variáveis/localidades. Ex.: GET /{agregado}/periodos/{periodo}/variaveis/{variavel}.
+    tags: [estatisticas, censo, sidra, ibge]
+
+  - id: ibge-nomes
+    name: IBGE Nomes
+    provider: IBGE
+    category: public
+    status: available
+    auth: none
+    base_url: https://servicodados.ibge.gov.br/api/v2/censos/nomes
+    docs_url: https://servicodados.ibge.gov.br/api/docs/nomes?versao=2
+    description: Frequência de nomes próprios no Brasil por década e UF (Censo). Ex.. GET /{nome}.
+    tags: [censo, nomes, ibge]
+
+  - id: bcb-sgs
+    name: Banco Central — SGS (séries temporais)
+    provider: Banco Central do Brasil
+    category: public
+    status: available
+    auth: none
+    base_url: https://api.bcb.gov.br/dados/serie
+    docs_url: https://dadosabertos.bcb.gov.br/dataset/20542-saldo-da-carteira-de-credito-com-recursos-livres---total
+    description: >-
+      Sistema Gerenciador de Séries Temporais: SELIC, IPCA, câmbio, crédito etc.
+      Ex.: GET /bcdata.sgs.433/dados/ultimos/12?formato=json (433 = IPCA).
+    tags: [economia, selic, ipca, cambio, bcb]
+
+  - id: bcb-olinda-ptax
+    name: Banco Central — PTAX (Olinda/OData)
+    provider: Banco Central do Brasil
+    category: public
+    status: available
+    auth: none
+    base_url: https://olinda.bcb.gov.br/olinda/servico/PTAX/versao/v1/odata
+    docs_url: https://olinda.bcb.gov.br/olinda/servico/PTAX/versao/v1/aplicacao
+    description: >-
+      Cotações de câmbio PTAX (dólar e demais moedas) em OData.
+      Ex.: GET /CotacaoDolarDia(dataCotacao=@dataCotacao)?@dataCotacao='08-06-2026'&$format=json.
+    tags: [cambio, dolar, ptax, odata, bcb]
+
+  - id: camara-dados-abertos
+    name: Câmara dos Deputados — Dados Abertos
+    provider: Câmara dos Deputados
+    category: public
+    status: available
+    auth: none
+    base_url: https://dadosabertos.camara.leg.br/api/v2
+    openapi_url: https://dadosabertos.camara.leg.br/api/v2/api-docs
+    docs_url: https://dadosabertos.camara.leg.br/swagger/api.html
+    description: >-
+      Deputados, proposições, votações, despesas (cota parlamentar), órgãos e eventos.
+      Ex.: GET /deputados, /proposicoes?siglaTipo=PL&ano=2026.
+    tags: [legislativo, deputados, proposicoes, votacoes]
+
+  - id: senado-dados-abertos
+    name: Senado Federal — Dados Abertos (LEGIS)
+    provider: Senado Federal
+    category: public
+    status: available
+    auth: none
+    base_url: https://legis.senado.leg.br/dadosabertos
+    docs_url: https://legis.senado.leg.br/dadosabertos/docs/
+    description: >-
+      Senadores, matérias, votações e comissões. Retorna XML por padrão; adicione
+      header Accept: application/json. Ex.: GET /senador/lista/atual.
+    tags: [legislativo, senadores, materias, votacoes]
+
+  - id: portal-transparencia
+    name: Portal da Transparência — API de Dados
+    provider: CGU
+    category: public
+    status: available
+    auth: api_key
+    auth_config:
+      header: chave-api-dados
+      env: TRANSPARENCIA_API_KEY
+      signup_url: https://api.portaldatransparencia.gov.br/
+    base_url: https://api.portaldatransparencia.gov.br
+    openapi_url: https://api.portaldatransparencia.gov.br/v3/api-docs
+    docs_url: https://api.portaldatransparencia.gov.br/swagger-ui/index.html
+    description: >-
+      Despesas, contratos, licitações, servidores, Bolsa Família/Novo Bolsa Família,
+      sanções (CEIS/CNEP), viagens. Chave gratuita via cadastro com login gov.br.
+      Os paths já incluem o prefixo /api-de-dados, como no spec.
+      Ex.: GET /api-de-dados/servidores?pagina=1.
+    tags: [transparencia, despesas, contratos, servidores, cgu]
+
+  - id: datajud
+    name: CNJ — DataJud API Pública
+    provider: CNJ
+    category: public
+    status: available
+    auth: api_key
+    auth_config:
+      header: Authorization
+      env: DATAJUD_API_KEY
+      value_prefix: "APIKey "
+      signup_url: https://datajud-wiki.cnj.jus.br/api-publica/acesso
+    base_url: https://api-publica.datajud.cnj.jus.br
+    docs_url: https://datajud-wiki.cnj.jus.br/api-publica/
+    description: >-
+      Metadados processuais de todos os tribunais (Elasticsearch _search por tribunal).
+      A chave é pública, publicada na wiki do CNJ. Ex.: POST /api_publica_tjsp/_search.
+    tags: [judiciario, processos, cnj, elasticsearch]
+
+  - id: ipeadata
+    name: Ipeadata (OData)
+    provider: IPEA
+    category: public
+    status: available
+    auth: none
+    base_url: https://www.ipeadata.gov.br/api/odata4
+    docs_url: https://www.ipeadata.gov.br/api/
+    description: >-
+      Séries macroeconômicas, regionais e sociais do IPEA em OData.
+      Ex.: GET /Metadados, /ValoresSerie(SERCODIGO='PRECOS12_IPCA12').
+    tags: [economia, series, ipea, odata]
+
+  - id: inmet-tempo
+    name: INMET — API Tempo
+    provider: INMET
+    category: public
+    status: unstable
+    auth: none
+    base_url: https://apitempo.inmet.gov.br
+    docs_url: https://portal.inmet.gov.br/manual/manual-de-uso-da-api-esta%C3%A7%C3%B5es
+    description: >-
+      Estações meteorológicas e dados horários/diários. Ex.: GET /estacoes/T (automáticas).
+      Marcada unstable: não respondeu na verificação de 2026-08-07; disponibilidade oscila.
+    tags: [meteorologia, clima, estacoes]
+
+  - id: dados-gov-br
+    name: dados.gov.br — API do Portal
+    provider: MGI
+    category: public
+    status: available
+    auth: api_key
+    auth_config:
+      header: chave-api-dados-abertos
+      env: DADOSGOV_API_KEY
+      signup_url: https://dados.gov.br/dados/conteudo/como-acessar-a-api-do-portal-de-dados-abertos
+    base_url: https://dados.gov.br/dados/api/publico
+    docs_url: https://dados.gov.br/swagger-ui/index.html
+    description: >-
+      Busca de conjuntos de dados, organizações e recursos do portal de dados abertos.
+      Chave gratuita gerada no perfil do usuário (login gov.br).
+    tags: [dados-abertos, ckan, catalogo]
+
+  - id: brasilapi
+    name: BrasilAPI (comunidade)
+    provider: Comunidade (não-oficial)
+    category: public
+    status: available
+    auth: none
+    community: true
+    base_url: https://brasilapi.com.br/api
+    docs_url: https://brasilapi.com.br/docs
+    description: >-
+      Não é API governamental — projeto comunitário que agrega fontes públicas com boa
+      disponibilidade: CNPJ (Receita), CEP, feriados, taxas, bancos, DDD, FIPE.
+      Ex.: GET /cnpj/v1/{cnpj}, /cep/v2/{cep}. Sem SLA; não usar para dado crítico.
+    tags: [cnpj, cep, feriados, comunidade]

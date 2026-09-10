@@ -1,0 +1,55 @@
+# Serpro commercial APIs (loja.serpro.gov.br) — available to private companies,
+# paid per call, OAuth2 client credentials issued per contracted API.
+# Each API also has a free trial plan ("Demonstração") with fixed sample data.
+apis:
+  - id: serpro-consulta-cpf
+    name: Serpro — Consulta CPF
+    provider: Serpro (comercial)
+    category: serpro
+    status: requires_contract
+    auth: oauth2_client_credentials
+    auth_config:
+      token_url: https://gateway.apiserpro.serpro.gov.br/token
+      client_id_env: SERPRO_CPF_CLIENT_ID
+      client_secret_env: SERPRO_CPF_CLIENT_SECRET
+    base_url: https://gateway.apiserpro.serpro.gov.br/consulta-cpf-df/v1
+    docs_url: https://apicenter.estaleiro.serpro.gov.br/documentacao/consulta-cpf/
+    description: >-
+      Situação cadastral de CPF direto da base da Receita Federal. Ex.: GET /cpf/{ni}.
+      Contratação na Loja Serpro; cobrado por consulta. Trial em
+      /consulta-cpf-df-trial/v1 com CPFs de exemplo e token demo publicado na doc.
+    tags: [cpf, receita-federal, cadastro]
+
+  - id: serpro-consulta-cnpj
+    name: Serpro — Consulta CNPJ
+    provider: Serpro (comercial)
+    category: serpro
+    status: requires_contract
+    auth: oauth2_client_credentials
+    auth_config:
+      token_url: https://gateway.apiserpro.serpro.gov.br/token
+      client_id_env: SERPRO_CNPJ_CLIENT_ID
+      client_secret_env: SERPRO_CNPJ_CLIENT_SECRET
+    base_url: https://gateway.apiserpro.serpro.gov.br/consulta-cnpj-df/v2
+    docs_url: https://apicenter.estaleiro.serpro.gov.br/documentacao/consulta-cnpj/
+    description: >-
+      Dados cadastrais de CNPJ da base da Receita Federal, em três granularidades
+      (básica, QSA, empresa). Ex.: GET /basica/{ni}. Trial em /consulta-cnpj-df-trial/v2.
+    tags: [cnpj, receita-federal, empresas, qsa]
+
+  - id: serpro-datavalid
+    name: Serpro — Datavalid
+    provider: Serpro (comercial)
+    category: serpro
+    status: requires_contract
+    auth: oauth2_client_credentials
+    auth_config:
+      token_url: https://gateway.apiserpro.serpro.gov.br/token
+      client_id_env: SERPRO_DATAVALID_CLIENT_ID
+      client_secret_env: SERPRO_DATAVALID_CLIENT_SECRET
+    base_url: https://gateway.apiserpro.serpro.gov.br/datavalid/v3
+    docs_url: https://apicenter.estaleiro.serpro.gov.br/documentacao/datavalid/
+    description: >-
+      Validação cadastral e biométrica (face) de pessoa física/jurídica contra bases
+      governamentais — retorna score de similaridade, não o dado. Ex.: POST /validate/pf-face.
+    tags: [validacao, biometria, kyc, onboarding]
