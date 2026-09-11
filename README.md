@@ -1,5 +1,7 @@
 # govbr-apis-mcp
 
+<!-- mcp-name: io.github.thalisantunes/govbr-apis-mcp -->
+
 MCP server that turns Brazilian government APIs into Claude-callable tools through a
 **spec-driven gateway**: instead of one tool per endpoint (hundreds — would blow up
 client context), five generic tools operate over a local YAML catalog and load each

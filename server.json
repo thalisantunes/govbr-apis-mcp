@@ -1,0 +1,35 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.thalisantunes/govbr-apis-mcp",
+  "title": "gov.br APIs MCP",
+  "description": "Brazilian government APIs through a spec-driven gateway over a YAML catalog.",
+  "version": "0.1.0",
+  "repository": {
+    "url": "https://github.com/thalisantunes/govbr-apis-mcp",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "govbr-apis-mcp",
+      "version": "0.1.0",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "TRANSPARENCIA_API_KEY",
+          "description": "API key for the Portal da Transparencia API",
+          "isSecret": true
+        },
+        {
+          "name": "DATAJUD_API_KEY",
+          "description": "API key for the CNJ DataJud API",
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}
