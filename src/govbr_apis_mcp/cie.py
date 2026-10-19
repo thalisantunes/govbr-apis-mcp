@@ -18,6 +18,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 API_ID = "meiaentrada-cie-validador"
@@ -242,6 +243,9 @@ def _unvalidated(response: dict[str, Any], provider: str) -> CieDecision | None:
 # treated as "not entitled".
 FESN_API_ID = "fesn-cie-validador"
 FESN_PATH = "/api/students/usecode"
+# The use code is embedded in a URL path, so it must be a plain token: "/", "?", "#",
+# spaces or dot-only segments would change the resource FESN is asked about.
+USE_CODE_RE = re.compile(r"(?!\.+$)[A-Za-z0-9._-]{1,64}")
 
 
 def expiry_reference(data_evento: str | None) -> date:
@@ -271,14 +275,18 @@ def interpret_fesn(
     payload: dict[str, Any],
     data_nascimento: str | None = None,
     data_evento: str | None = None,
+    *,
+    codigo_uso: str,
 ) -> CieDecision:
     """Turn an FESN response into a decision.
 
-    Two checks this API does not do for us:
-    - expiry: `validity` is returned but never enforced — and it must be compared
-      against the event date, not today;
+    Checks this API does not do for us:
+    - record: the payload must carry the use code we asked for. An error object, an
+      empty body or someone else's record is not the card, whatever else it contains;
+    - expiry: `validity` is returned but never enforced — it must be readable and is
+      compared against the event date, not today;
     - identity: the card validates from the use code alone, so when a birth date is
-      supplied we compare it ourselves.
+      supplied we compare it ourselves (and refuse if FESN gave none to compare).
 
     Be honest about what that birth-date check is worth: FESN answers unauthenticated
     and returns `birth` in the body, so anyone holding the use code can read the date
@@ -286,17 +294,33 @@ def interpret_fesn(
     Real identity binding has to happen where possession meets the person — a ticket
     named after the CIE holder, checked at the gate.
     """
-    if not payload.get("useCode") and not payload.get("name"):
-        return CieDecision(False, "carteirinha não encontrada na base FESN", {}, payload, "fesn")
+    returned = str(payload.get("useCode") or "").strip().casefold()
+    if not returned or returned != codigo_uso.strip().casefold():
+        return CieDecision(
+            False,
+            "carteirinha não encontrada na base FESN — a resposta não traz o código consultado",
+            {},
+            payload,
+            "fesn",
+        )
 
     expires = parse_date(payload.get("validity"))
     problem = _expiry_problem(expires, expiry_reference(data_evento))
     if problem:
         return CieDecision(False, problem, {}, payload, "fesn")
 
-    birth = (payload.get("birth") or "")[:10].replace("-", "")
-    if data_nascimento and birth:
-        expected = normalize_date(data_nascimento, "dataNascimento")
+    if data_nascimento:
+        expected = _require_date(data_nascimento, "dataNascimento")
+        birth = parse_date(payload.get("birth"))
+        if birth is None:
+            return CieDecision(
+                False,
+                "data de nascimento da FESN não informada/ilegível — "
+                "não dá para confirmar a titularidade",
+                {},
+                payload,
+                "fesn",
+            )
         if birth != expected:
             return CieDecision(
                 False,
@@ -329,12 +353,18 @@ def check_fesn(
     data_evento: str | None = None,
 ) -> CieDecision:
     """Validate a CIE against the FESN base."""
-    if not (codigo_uso or "").strip():
+    code = (codigo_uso or "").strip()
+    if not code:
         raise InvalidInput("codigoUso é obrigatório")
+    if not USE_CODE_RE.fullmatch(code):
+        raise InvalidInput(
+            "codigoUso: use 1 a 64 letras, dígitos, '.', '_' ou '-' "
+            f"(sem '/', '?', '#' ou espaços) — got {code!r}"
+        )
     if caller is None:
         from .server import call_api as caller
 
-    response = caller(FESN_API_ID, f"{FESN_PATH}/{codigo_uso.strip()}", method="GET")
+    response = caller(FESN_API_ID, f"{FESN_PATH}/{quote(code, safe='')}", method="GET")
     if response.get("status") == 404:
         # FESN answers an unknown use code with a 404 and an error object ({"name":
         # "NotFoundError"...}). That is its verdict on the card, unlike a 5xx; reading the
@@ -345,7 +375,7 @@ def check_fesn(
     unvalidated = _unvalidated(response, "fesn")
     if unvalidated:
         return unvalidated
-    return interpret_fesn(response["body"], data_nascimento, data_evento)
+    return interpret_fesn(response["body"], data_nascimento, data_evento, codigo_uso=code)
 
 
 def check_any(

@@ -17,6 +17,7 @@ from govbr_apis_mcp.cie import (
 )
 
 TODAY = date(2026, 10, 19)
+CODE = "AB12CD34"
 
 
 def reply(body, status=200):
@@ -147,25 +148,26 @@ FESN_OK = {
 
 
 def test_fesn_valid_card():
-    d = interpret_fesn(FESN_OK, "01/01/1990")
+    d = interpret_fesn(FESN_OK, "01/01/1990", codigo_uso=CODE)
     assert d.eligible and d.provider == "fesn"
     assert d.holder["instituicao"] == "IFRS" and d.holder["has_photo"] is True
 
 
 def test_fesn_rejects_wrong_birth_date():
     """FESN validates from the use code alone, so we check identity ourselves."""
-    d = interpret_fesn(FESN_OK, "1990-01-02")
+    d = interpret_fesn(FESN_OK, "1990-01-02", codigo_uso=CODE)
     assert not d.eligible and "não confere" in d.reason
 
 
 def test_fesn_rejects_expired_card():
     """`validity` comes in the payload but the API never enforces it."""
-    d = interpret_fesn({**FESN_OK, "validity": "2020-03-31 23:59:59"}, None)
+    d = interpret_fesn({**FESN_OK, "validity": "2020-03-31 23:59:59"}, None, codigo_uso=CODE)
     assert not d.eligible and "vence em" in d.reason
 
 
 def test_fesn_unknown_card():
-    assert not interpret_fesn({}, None).eligible
+    d = interpret_fesn({}, None, codigo_uso=CODE)
+    assert not d.eligible and d.validated and "não encontrada" in d.reason
 
 
 def test_check_any_falls_back_to_fesn(monkeypatch):
@@ -194,12 +196,16 @@ def test_check_any_reason_when_all_bases_fail():
 
 def test_expiry_is_checked_against_event_date_not_today():
     """A card expiring before the show must not approve a purchase made today."""
-    d = interpret_fesn({**FESN_OK, "validity": "2026-09-30 23:59:59"}, None, "2026-12-20")
+    d = interpret_fesn(
+        {**FESN_OK, "validity": "2026-09-30 23:59:59"}, None, "2026-12-20", codigo_uso=CODE
+    )
     assert not d.eligible and "antes da data do evento" in d.reason
 
 
 def test_card_valid_through_event_date_passes():
-    d = interpret_fesn({**FESN_OK, "validity": "2027-03-31 23:59:59"}, None, "2026-12-20")
+    d = interpret_fesn(
+        {**FESN_OK, "validity": "2027-03-31 23:59:59"}, None, "2026-12-20", codigo_uso=CODE
+    )
     assert d.eligible
 
 
@@ -249,7 +255,9 @@ def test_card_is_still_valid_on_its_last_day_late_in_the_evening(monkeypatch):
     """After 21:00 in Brasília the UTC date is already tomorrow and refused the card."""
     late_evening = datetime(2026, 12, 21, 2, 30, tzinfo=UTC)
     monkeypatch.setattr(cie, "today_br", lambda: today_br(late_evening))
-    assert interpret_fesn({**FESN_OK, "validity": "2026-12-20 23:59:59"}, None).eligible
+    assert interpret_fesn(
+        {**FESN_OK, "validity": "2026-12-20 23:59:59"}, None, codigo_uso=CODE
+    ).eligible
     assert interpret({"status": True, "nome": "X", "dataExpiracao": "2026-12-20"}).eligible
 
 
@@ -298,13 +306,13 @@ def test_dne_card_valid_through_the_event_passes_in_every_format(expiry):
 
 @pytest.mark.parametrize("expiry", EXPIRED)
 def test_fesn_expiry_is_compared_as_a_date_in_every_format(expiry):
-    d = interpret_fesn({**FESN_OK, "validity": expiry}, None, "2026-12-20")
+    d = interpret_fesn({**FESN_OK, "validity": expiry}, None, "2026-12-20", codigo_uso=CODE)
     assert not d.eligible and "antes da data do evento" in d.reason
 
 
 @pytest.mark.parametrize("expiry", VALID_THROUGH_EVENT)
 def test_fesn_card_valid_through_the_event_passes_in_every_format(expiry):
-    d = interpret_fesn({**FESN_OK, "validity": expiry}, None, "2026-12-20")
+    d = interpret_fesn({**FESN_OK, "validity": expiry}, None, "2026-12-20", codigo_uso=CODE)
     assert d.eligible and d.holder["dataExpiracao"] == "2027-03-31"
 
 
@@ -334,7 +342,7 @@ def test_fesn_missing_or_unreadable_validity_fails_closed(expiry):
     payload = {k: v for k, v in FESN_OK.items() if k != "validity"}
     if expiry is not None:
         payload["validity"] = expiry
-    d = interpret_fesn(payload, None, "2026-12-20")
+    d = interpret_fesn(payload, None, "2026-12-20", codigo_uso=CODE)
     assert not d.eligible and "validade não informada/ilegível" in d.reason
 
 
@@ -443,3 +451,104 @@ def test_check_any_still_approves_via_fesn_when_dne_is_unreachable():
 
     d = check_any("AB12CD34", "1990-01-01", "Show", "00000000000191", caller=fake_call)
     assert d.eligible and d.validated and d.provider == "fesn"
+
+
+# --- FESN must prove the record is the card we asked for --------------------------
+
+
+def test_fesn_200_with_an_error_object_is_not_a_card():
+    """`name` is the error class in {"name": "NotFoundError"}: it must not read as a holder."""
+    d = call_fesn(reply({"name": "NotFoundError", "message": "no such code"}))
+    assert not d.eligible and d.validated and "não encontrada" in d.reason
+
+
+def test_fesn_200_without_validity_is_refused():
+    payload = {k: v for k, v in FESN_OK.items() if k != "validity"}
+    d = call_fesn(reply(payload))
+    assert not d.eligible and "validade não informada/ilegível" in d.reason
+
+
+def test_fesn_200_with_a_different_use_code_is_refused_without_echoing_it():
+    d = call_fesn(reply({**FESN_OK, "useCode": "ZZ99ZZ99"}))
+    assert not d.eligible and d.holder == {} and "não encontrada" in d.reason
+    assert "ZZ99ZZ99" not in d.reason  # another person's card code
+
+
+def test_fesn_200_valid_card_is_approved_end_to_end():
+    captured = {}
+
+    def fake_call(api_id, path, method=None, **kwargs):
+        captured.update(api_id=api_id, path=path, method=method)
+        return reply(FESN_OK)
+
+    d = check_fesn(CODE, "1990-01-01", caller=fake_call, data_evento="2026-12-20")
+    assert d.eligible and d.validated and d.provider == "fesn"
+    assert captured == {
+        "api_id": "fesn-cie-validador",
+        "path": "/api/students/usecode/AB12CD34",
+        "method": "GET",
+    }
+
+
+def test_fesn_use_code_is_compared_ignoring_case_and_padding():
+    assert call_fesn(reply({**FESN_OK, "useCode": "ab12cd34"}), " AB12CD34 ").eligible
+
+
+@pytest.mark.parametrize("returned", [None, "", "  "])
+def test_fesn_never_matches_an_empty_requested_code(returned):
+    d = interpret_fesn({"useCode": returned, "validity": "2027-03-31"}, codigo_uso=" ")
+    assert not d.eligible
+
+
+def test_interpret_fesn_cannot_be_called_without_the_requested_code():
+    """Making it optional would silently skip the identity check of the record."""
+    with pytest.raises(TypeError):
+        interpret_fesn(FESN_OK)
+
+
+def test_fesn_birth_date_supplied_but_not_returned_fails_closed():
+    payload = {k: v for k, v in FESN_OK.items() if k != "birth"}
+    d = interpret_fesn(payload, "01/01/1990", codigo_uso=CODE)
+    assert not d.eligible and "nascimento da FESN não informada/ilegível" in d.reason
+
+
+def test_fesn_unreadable_birth_date_fails_closed():
+    d = interpret_fesn({**FESN_OK, "birth": "N/A"}, "01/01/1990", codigo_uso=CODE)
+    assert not d.eligible and "não informada/ilegível" in d.reason
+
+
+def test_fesn_without_a_supplied_birth_date_does_not_check_identity():
+    payload = {k: v for k, v in FESN_OK.items() if k != "birth"}
+    assert interpret_fesn(payload, None, codigo_uso=CODE).eligible
+
+
+def test_fesn_malformed_supplied_birth_date_is_invalid_input():
+    with pytest.raises(InvalidInput, match="dataNascimento"):
+        interpret_fesn(FESN_OK, "20261399", codigo_uso=CODE)
+
+
+# --- codigoUso goes into a URL path: it must not be able to change the resource ---
+
+
+@pytest.mark.parametrize(
+    "codigo",
+    ["AB/12", "AB?x=1", "AB 12", "../x", ".", "..", "...", "A" * 65, "AB12#f", "ab%2Fcd", "AB\n12"],
+)
+def test_fesn_rejects_codes_that_would_change_the_requested_resource(codigo):
+    def must_not_be_called(*args, **kwargs):
+        raise AssertionError("an invalid code must never reach the gateway")
+
+    with pytest.raises(InvalidInput, match="codigoUso"):
+        check_fesn(codigo, caller=must_not_be_called)
+
+
+@pytest.mark.parametrize("codigo", ["AB12CD34", "ab-12_cd.34", "A", "A" * 64, "0000123"])
+def test_fesn_accepts_plain_use_codes_and_puts_them_in_the_path_as_is(codigo):
+    seen = {}
+
+    def fake_call(api_id, path, **kwargs):
+        seen["path"] = path
+        return reply({"name": "NotFoundError"}, 404)
+
+    check_fesn(codigo, caller=fake_call)
+    assert seen["path"] == f"/api/students/usecode/{codigo}"
