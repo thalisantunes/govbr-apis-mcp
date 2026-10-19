@@ -12,7 +12,8 @@ Quirks worth knowing (verified 2026-08-07 against the live DNE endpoint):
   Confusing one for the other sends you debugging the wrong thing.
 - Since it answers 200 even when it fails, only the codes in RETURN_CODES are verdicts: 1
   approves (with a true `status`), 2 is the one known refusal, 5 is our own request out of
-  contract. Any other code is an answer we do not recognize, so it is "not validated".
+  contract. Any other code is an answer we do not recognize, so it is "not validated"; so is
+  a true `status` with no code at all, which the API never sends.
 
 Two rules hold for every issuer:
 - Fail closed: whatever a decision depends on (HTTP status, use code, expiry, birth date)
@@ -69,7 +70,8 @@ REFUSAL_CODES = ("2",)  # the one refusal the API is known to give for a card
 # `raw`: the rest (name, CPF, birth date, photo...) belongs to whoever holds the card, and
 # a caller who merely guessed a code or a birth date must not receive it.
 SAFE_RAW_KEYS = ("status", "codigoRetorno", "mensagem", "message", "dataExpiracao", "validity")
-MAX_TEXT = 200  # an issuer's free text is clipped to this many characters wherever we copy it
+FREE_TEXT_KEYS = ("mensagem", "message")  # an issuer's free text: copied only as text
+MAX_TEXT = 200  # and clipped to this many characters wherever we copy it
 
 
 class InvalidInput(ValueError):
@@ -108,7 +110,8 @@ def _clip(text: str, limit: int = MAX_TEXT) -> str:
 def _safe_raw(payload: dict[str, Any]) -> dict[str, Any]:
     """The part of a validator payload that carries no personal data (see SAFE_RAW_KEYS).
 
-    Only scalar values survive and free text is clipped: an issuer's text can say anything.
+    Only scalar values survive (the free-text keys only as text) and text is clipped: an
+    issuer's text can say anything.
     """
     safe: dict[str, Any] = {}
     for key in SAFE_RAW_KEYS:
@@ -117,7 +120,7 @@ def _safe_raw(payload: dict[str, Any]) -> dict[str, Any]:
         value = payload[key]
         if isinstance(value, str):
             safe[key] = _clip(value)
-        elif value is None or isinstance(value, (bool, int, float)):
+        elif key not in FREE_TEXT_KEYS and (value is None or isinstance(value, (bool, int, float))):
             safe[key] = value
     return safe
 
@@ -212,8 +215,9 @@ def interpret(payload: dict[str, Any], data_evento: str | None = None) -> CieDec
       `status` is one too;
     - 5 is our own request out of contract and any other code is one we do not know: neither
       says anything about the card;
-    - a true `status` with a code other than 1 contradicts itself, and a payload with neither
-      a boolean `status` nor a code says nothing.
+    - a true `status` needs code 1: with another code it contradicts itself, and with none it
+      is out of contract (the API always sends a code); a payload with neither a boolean
+      `status` nor a code says nothing.
     Whatever is not a verdict on the card comes back "not validated", not "not eligible".
     """
     status = payload.get("status")
@@ -225,7 +229,14 @@ def interpret(payload: dict[str, Any], data_evento: str | None = None) -> CieDec
     message = _clip(text.strip()) if isinstance(text, str) else ""
 
     if approved:
-        if code not in (None, APPROVAL_CODE):
+        if code is None:
+            return _unvalidated(
+                "resposta fora do contrato: status verdadeiro sem codigoRetorno (o DNE sempre "
+                "envia o código), sem decisão",
+                payload,
+                "dne",
+            )
+        if code != APPROVAL_CODE:
             return _unvalidated(
                 f"veredito contraditório: status verdadeiro com codigoRetorno {_clip(code, 40)}, "
                 "sem decisão",
@@ -385,7 +396,9 @@ def expiry_reference(data_evento: str | None) -> date:
     """The date a card's validity must be checked against: the event, not the purchase.
 
     Checking against today lets a card expiring in September approve a ticket for a
-    December show — buying early, not sophisticated fraud.
+    December show — buying early, not sophisticated fraud. The day is judged as given: an
+    event in the past accepts a card that has already expired today, by design; whoever needs
+    current validity passes today's date.
     """
     if data_evento is not None:
         return _require_date(data_evento, "dataEvento")

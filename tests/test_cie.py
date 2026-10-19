@@ -78,6 +78,7 @@ def test_interpret_approved_extracts_holder():
     d = interpret(
         {
             "status": True,
+            "codigoRetorno": "1",
             "mensagem": "documento válido",
             "nome": "MARIA",
             "cpf": "123",
@@ -94,7 +95,9 @@ def test_interpret_approved_extracts_holder():
 
 def test_interpret_accepts_status_as_string():
     """The API returns the string "true" in some paths — the front-end handles both."""
-    assert interpret({"status": "true", "nome": "X", "dataExpiracao": "20270331"}).eligible
+    assert interpret(
+        {"status": "true", "codigoRetorno": "1", "nome": "X", "dataExpiracao": "20270331"}
+    ).eligible
 
 
 def test_interpret_maps_known_return_codes():
@@ -130,7 +133,9 @@ def test_check_sends_expected_request():
 
     def fake_call(api_id, path, method=None, body=None, **kwargs):
         captured.update(api_id=api_id, path=path, method=method, body=body)
-        return reply({"status": True, "nome": "MARIA", "dataExpiracao": "20270331"})
+        return reply(
+            {"status": True, "codigoRetorno": "1", "nome": "MARIA", "dataExpiracao": "20270331"}
+        )
 
     d = check("ABC", "2000-01-15", "Show", "00000000000191", "2026-09-07", caller=fake_call)
     assert d.eligible
@@ -234,7 +239,9 @@ def test_card_is_still_valid_on_its_last_day_late_in_the_evening(monkeypatch):
     assert interpret_fesn(
         {**FESN_OK, "validity": "2026-06-20 23:59:59"}, None, codigo_uso=CODE
     ).eligible
-    assert interpret({"status": True, "nome": "X", "dataExpiracao": "2026-06-20"}).eligible
+    assert interpret(
+        {"status": True, "codigoRetorno": "1", "nome": "X", "dataExpiracao": "2026-06-20"}
+    ).eligible
 
 
 # --- dates: one parser, a real calendar, compared as dates ------------------------
@@ -271,13 +278,19 @@ def test_dne_expiry_is_compared_as_a_date_in_every_format(expiry):
     """Expiry is compared as a date, not as text ("20260930" > "2026-12-20" as strings), in
     every format; the DNE `status` alone is never trusted for it. This card is still valid
     today but expires before the event, so it also tells the event date from the purchase."""
-    d = interpret({"status": True, "nome": "X", "dataExpiracao": expiry}, data_evento="2026-12-20")
+    d = interpret(
+        {"status": True, "codigoRetorno": "1", "nome": "X", "dataExpiracao": expiry},
+        data_evento="2026-12-20",
+    )
     assert not d.eligible and "antes da data do evento" in d.reason and d.holder == {}
 
 
 @pytest.mark.parametrize("expiry", VALID_THROUGH_EVENT)
 def test_dne_card_valid_through_the_event_passes_in_every_format(expiry):
-    d = interpret({"status": True, "nome": "X", "dataExpiracao": expiry}, data_evento="2026-12-20")
+    d = interpret(
+        {"status": True, "codigoRetorno": "1", "nome": "X", "dataExpiracao": expiry},
+        data_evento="2026-12-20",
+    )
     assert d.eligible
 
 
@@ -295,7 +308,7 @@ def test_fesn_card_valid_through_the_event_passes_in_every_format(expiry):
 
 
 def test_card_is_valid_through_the_event_day_itself():
-    payload = {"status": True, "nome": "X"}
+    payload = {"status": True, "codigoRetorno": "1", "nome": "X"}
     assert interpret({**payload, "dataExpiracao": "2026-12-20"}, data_evento="20261220").eligible
     assert not interpret(
         {**payload, "dataExpiracao": "2026-12-19"}, data_evento="20261220"
@@ -314,12 +327,15 @@ UNREADABLE_DATES = [
     "2027-03-31 9x",
     "2027-03-31T99:99",
     "2027-03-31 23:59:59 extra",
+    "٢٠٩٩-12-31",  # Arabic-Indic digits: 2099, which would never expire
+    "٢٠٩٩1231",
+    "31/12/٢٠٩٩",
 ]
 
 
 @pytest.mark.parametrize("expiry", UNREADABLE_DATES)
 def test_dne_missing_or_unreadable_expiry_fails_closed(expiry):
-    payload = {"status": True, "nome": "X", "cpf": "123"}
+    payload = {"status": True, "codigoRetorno": "1", "nome": "X", "cpf": "123"}
     if expiry is not None:
         payload["dataExpiracao"] = expiry
     d = interpret(payload, data_evento="2026-12-20")
@@ -336,7 +352,7 @@ def test_fesn_missing_or_unreadable_validity_fails_closed(expiry):
 
 
 def test_expiry_without_event_date_uses_the_pinned_brazilian_today():
-    payload = {"status": True, "nome": "X"}
+    payload = {"status": True, "codigoRetorno": "1", "nome": "X"}
     today = TODAY.strftime("%Y%m%d")
     yesterday = (TODAY - timedelta(days=1)).strftime("%Y%m%d")
     assert interpret({**payload, "dataExpiracao": today}).eligible  # its last day
@@ -345,7 +361,12 @@ def test_expiry_without_event_date_uses_the_pinned_brazilian_today():
 
 # --- a response must be a complete 2xx before it can carry a verdict -------------
 
-APPROVING_DNE_BODY = {"status": True, "nome": "MARIA", "dataExpiracao": "20270331"}
+APPROVING_DNE_BODY = {
+    "status": True,
+    "codigoRetorno": "1",
+    "nome": "MARIA",
+    "dataExpiracao": "20270331",
+}
 
 
 def call_dne(response):
@@ -599,7 +620,9 @@ def test_check_any_with_both_bases_down_is_not_validated_and_names_both():
 def test_check_any_returns_the_dne_approval_without_asking_fesn():
     def fake_call(api_id, path, **kwargs):
         assert api_id == "meiaentrada-cie-validador"
-        return reply({"status": True, "nome": "MARIA", "dataExpiracao": "20270331"})
+        return reply(
+            {"status": True, "codigoRetorno": "1", "nome": "MARIA", "dataExpiracao": "20270331"}
+        )
 
     d = check_any("ABC", "20000115", "e", "00000000000191", "2026-12-20", fake_call)
     assert d.eligible and d.provider == "dne"
@@ -858,7 +881,7 @@ def test_fesn_empty_birth_date_is_invalid_input_not_a_skipped_check():
 @pytest.mark.parametrize("empty", ["", "   "])
 def test_empty_event_date_is_invalid_input_in_every_path(empty):
     """`data_evento=""` used to mean "today" and approve a card that expires before the event."""
-    approved = {"status": True, "nome": "X", "dataExpiracao": "20260930"}
+    approved = {"status": True, "codigoRetorno": "1", "nome": "X", "dataExpiracao": "20260930"}
     fesn_card = {**FESN_OK, "validity": "2026-09-30 23:59:59"}
     with pytest.raises(InvalidInput, match="dataEvento"):
         build_payload("ABC", "20000115", "x", "00000000000191", empty)
@@ -948,12 +971,30 @@ def test_dne_true_status_with_a_contradicting_code_is_not_validated(status, code
     assert "MARIA DA SILVA" not in json.dumps(d.as_dict(), ensure_ascii=False)
 
 
-@pytest.mark.parametrize("code", [None, "1", 1])
-def test_dne_true_status_with_no_code_or_code_1_is_approved(code):
-    payload = {"status": True, "nome": "X", "dataExpiracao": "20270331"}
-    if code is not None:
-        payload["codigoRetorno"] = code
+@pytest.mark.parametrize("code", ["1", 1])
+def test_dne_true_status_with_code_1_is_approved(code):
+    payload = {"status": True, "nome": "X", "dataExpiracao": "20270331", "codigoRetorno": code}
     assert interpret(payload, data_evento="2026-12-20").eligible
+
+
+@pytest.mark.parametrize("status", [True, "true"])
+def test_dne_true_status_without_a_code_is_out_of_contract_not_an_approval(status):
+    """The catalog says the DNE always answers {status, codigoRetorno, mensagem}."""
+    payload = {
+        "status": status,
+        "nome": "MARIA DA SILVA",
+        "cpf": "123.456.789-00",
+        "dataExpiracao": "20270331",
+    }
+    d = interpret(payload, data_evento="2026-12-20")
+    assert not d.eligible and not d.validated and d.holder == {} and d.provider == "dne"
+    assert "fora do contrato" in d.reason and "sem decisão" in d.reason
+    assert "MARIA DA SILVA" not in json.dumps(d.as_dict(), ensure_ascii=False)
+
+
+def test_dne_true_status_without_a_code_through_check_is_not_validated():
+    d = call_dne(reply({"status": True, "nome": "X", "dataExpiracao": "20270331"}))
+    assert not d.eligible and not d.validated and d.provider == "dne"
 
 
 def test_dne_contradicting_payload_through_check_is_not_validated():
@@ -991,9 +1032,19 @@ def test_free_text_from_the_validator_is_clipped_and_non_text_is_dropped_from_ra
 @pytest.mark.parametrize(
     "payload",
     [
-        {"status": True, "nome": "X", "dataExpiracao": "20270331"},  # approved
-        {"status": True, "nome": "X", "dataExpiracao": "20260930"},  # expired for the event
-        {"status": True, "nome": "X"},  # approved without a readable validity
+        {
+            "status": True,
+            "codigoRetorno": "1",
+            "nome": "X",
+            "dataExpiracao": "20270331",
+        },  # approved
+        {
+            "status": True,
+            "codigoRetorno": "1",
+            "nome": "X",
+            "dataExpiracao": "20260930",
+        },  # expired for the event
+        {"status": True, "codigoRetorno": "1", "nome": "X"},  # approved without a readable validity
         {"status": True, "codigoRetorno": "2"},  # contradiction
         {"status": False, "codigoRetorno": "2"},  # refusal
         {"status": False},  # refusal without a code
@@ -1029,7 +1080,9 @@ def test_check_sends_the_event_date_and_judges_the_card_against_it():
 
     def fake_call(api_id, path, method=None, body=None, **kwargs):
         seen["body"] = body
-        return reply({"status": True, "nome": "X", "dataExpiracao": "20260930"})
+        return reply(
+            {"status": True, "codigoRetorno": "1", "nome": "X", "dataExpiracao": "20260930"}
+        )
 
     d = check("ABC", "2000-01-15", "Show", "00000000000191", "2026-12-20", caller=fake_call)
     assert seen["body"]["dataEvento"] == "20261220"
@@ -1037,7 +1090,9 @@ def test_check_sends_the_event_date_and_judges_the_card_against_it():
 
 
 def test_check_any_propagates_event_date_to_dne():
-    approved_until_september = reply({"status": True, "nome": "X", "dataExpiracao": "20260930"})
+    approved_until_september = reply(
+        {"status": True, "codigoRetorno": "1", "nome": "X", "dataExpiracao": "20260930"}
+    )
     caller = dne_and_fesn(approved_until_september, FESN_NOT_FOUND)
     d = check_any(CODE, "20000115", "e", "00000000000191", "2026-12-20", caller)
     assert not d.eligible and d.validated
@@ -1141,7 +1196,9 @@ def test_the_clock_is_read_once_and_the_same_day_is_used_for_every_base(monkeypa
 def test_dne_card_is_judged_against_the_day_that_was_sent(monkeypatch):
     reads = iter([date(2026, 8, 7), date(2026, 12, 31)])
     monkeypatch.setattr(cie, "today_br", lambda: next(reads))
-    d = call_dne(reply({"status": True, "nome": "X", "dataExpiracao": "20260930"}))
+    d = call_dne(
+        reply({"status": True, "codigoRetorno": "1", "nome": "X", "dataExpiracao": "20260930"})
+    )
     assert d.eligible
 
 
@@ -1150,3 +1207,73 @@ def test_check_fesn_judges_the_card_against_the_day_resolved_before_the_request(
     monkeypatch.setattr(cie, "today_br", lambda: next(reads))
     d = call_fesn(reply({**FESN_OK, "validity": "2026-09-30 23:59:59"}))
     assert d.eligible  # valid on the first read; a second read (2026-12-31) would expire it
+
+
+# --- digits of other scripts are not digits of a date ---------------------------------------------------------
+
+# strptime reads a non-ASCII year but not a non-ASCII month or day, so each format needs a
+# case with only the year written in another script.
+NON_ASCII_DATES = [
+    "٢٠٩٩-12-31",  # Arabic-Indic year, ASCII month and day
+    "٢٠٩٩1231",  # the same year in YYYYMMDD
+    "31/12/٢٠٩٩",  # and in DD/MM/YYYY
+    "٢٠٢٧-٠٣-٣١",
+    "2027-٠٣-31",
+    "٢٠٩٩١٢٣١",
+    "३१/१२/२०९९",  # Devanagari
+    "２０２７-03-31",  # fullwidth
+]
+
+
+@pytest.mark.parametrize("value", NON_ASCII_DATES)
+def test_dates_written_with_non_ascii_digits_are_not_dates(value):
+    assert parse_date(value) is None
+    with pytest.raises(InvalidInput):
+        normalize_date(value, "dataEvento")
+
+
+# --- free text keys keep only text in raw -------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("key", ["mensagem", "message"])
+@pytest.mark.parametrize("value", [123, 4.5, True, None, ["x"], {"a": 1}])
+def test_free_text_keys_that_are_not_text_are_dropped_from_raw(key, value):
+    d = interpret({"status": False, "codigoRetorno": "2", key: value})
+    assert key not in d.raw
+
+
+def test_free_text_keys_keep_text_clipped_to_200_characters():
+    d = interpret({"status": False, "codigoRetorno": "2", "mensagem": "m" * 500, "message": "ok"})
+    assert d.raw["message"] == "ok" and len(d.raw["mensagem"]) == 200
+
+
+def test_a_message_that_is_not_text_never_reaches_the_reason():
+    d = interpret({"status": False, "codigoRetorno": "99", "mensagem": 123456})
+    assert "123456" not in d.reason and not d.validated
+
+
+def test_other_scalar_keys_keep_their_type_in_raw():
+    d = interpret({"status": None, "codigoRetorno": 2, "dataExpiracao": "20260930"})
+    assert d.raw == {"status": None, "codigoRetorno": 2, "dataExpiracao": "20260930"}
+
+
+# --- a failed decision still says which base failed -----------------------------------------------------------------
+
+GATEWAY_FAILURES = [
+    {"error": "ConnectError: boom"},
+    reply("Bad Gateway", 502),
+    reply({"text": "x", "truncated": True}),
+    reply({"text": "<html>", "parse_error": "bad json"}),
+    reply("<html>"),
+    {"body": {}},  # no HTTP status
+]
+
+
+@pytest.mark.parametrize("response", GATEWAY_FAILURES)
+def test_gateway_failures_still_name_the_base_that_failed(response):
+    assert call_dne(response).provider == "dne"
+    assert call_fesn(response).provider == "fesn"
+
+
+def test_the_fesn_not_found_verdict_names_fesn():
+    assert call_fesn(FESN_NOT_FOUND).provider == "fesn"

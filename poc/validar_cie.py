@@ -15,9 +15,10 @@ gravadas da API real; a aprovação é sintética):
 Exit code: 0 elegível; 1 não elegível (os validadores responderam e a carteirinha não
 vale); 2 entrada inválida, ou credencial ausente com --provedor dne; 3 não validado
 (faltou resposta utilizável para decidir: rede ou gateway, HTTP fora de 2xx, resposta
-truncada, ilegível ou sem veredito, codigoRetorno 5 ou desconhecido, exceção inesperada,
-inclusive ao imprimir; em auto, também quando uma base não encontrou a carteirinha e a
-outra falhou). O 3 nunca é recusa: tente de novo ou peça comprovação documental.
+truncada, ilegível ou sem veredito, codigoRetorno 5 ou desconhecido, status verdadeiro sem
+código, exceção inesperada, inclusive ao imprimir; em auto, também quando uma base não
+encontrou a carteirinha e a outra falhou). O 3 nunca é recusa: tente de novo ou peça
+comprovação documental.
 """
 
 from __future__ import annotations
@@ -122,6 +123,57 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def show_demo(decisions: dict, as_json: bool) -> None:
+    if as_json:
+        as_dicts = {name: decision.as_dict() for name, decision in decisions.items()}
+        print(json.dumps(as_dicts, ensure_ascii=False, indent=2))
+    else:
+        for name, decision in decisions.items():
+            render(decision, name)
+    print(
+        "\n(demo: nenhuma chamada de rede; use os argumentos reais para validar de verdade)",
+        file=sys.stderr if as_json else sys.stdout,
+    )
+
+
+def show(decision, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(decision.as_dict(), ensure_ascii=False, indent=2))
+    else:
+        render(decision, "resultado")
+
+
+def _discard_stdout() -> None:
+    """Point stdout's file descriptor at /dev/null; do nothing if stdout has none."""
+    try:
+        fd = sys.stdout.fileno()
+        devnull = os.open(os.devnull, os.O_WRONLY)
+    except (OSError, ValueError):
+        return
+    try:
+        os.dup2(devnull, fd)
+    except OSError:
+        pass
+    finally:
+        os.close(devnull)
+
+
+def emit(output, *args) -> None:
+    """Print through `output(*args)` and flush, as part of the run (inside main's try).
+
+    Buffered output only fails when it is flushed, so the flush is part of the step. If stdout
+    fails with an I/O error (a closed pipe), fd 1 is pointed at /dev/null before the error
+    propagates: the interpreter flushes stdout again when it exits, and a stream that already
+    failed would turn the exit code we choose into 120.
+    """
+    try:
+        output(*args)
+        sys.stdout.flush()
+    except OSError:
+        _discard_stdout()
+        raise
+
+
 def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     """Everything after the arguments are parsed, output included."""
     if args.demo:
@@ -136,16 +188,7 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
             )
             for name, payload in DEMO_CASES.items()
         }
-        if args.json:
-            as_dicts = {name: decision.as_dict() for name, decision in decisions.items()}
-            print(json.dumps(as_dicts, ensure_ascii=False, indent=2))
-        else:
-            for name, decision in decisions.items():
-                render(decision, name)
-        print(
-            "\n(demo: nenhuma chamada de rede; use os argumentos reais para validar de verdade)",
-            file=sys.stderr if args.json else sys.stdout,
-        )
+        emit(show_demo, decisions, args.json)
         return 0
 
     # Só o DNE exige data de nascimento e CNPJ; a FESN consulta pelo código de uso.
@@ -178,10 +221,7 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
             data_evento=args.data_evento,
         )
 
-    if args.json:
-        print(json.dumps(decision.as_dict(), ensure_ascii=False, indent=2))
-    else:
-        render(decision, "resultado")
+    emit(show, decision, args.json)
     if not decision.validated:
         return 3
     return 0 if decision.eligible else 1

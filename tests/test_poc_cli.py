@@ -4,6 +4,7 @@ Nothing here touches the network: the demo is offline, and every other run repla
 gateway (`server.call_api`) with a stub.
 """
 
+import errno
 import importlib.util
 import json
 import os
@@ -195,7 +196,9 @@ def test_auto_and_fesn_agree_on_the_same_expired_card(poc, monkeypatch):
 
 # --- exit codes: 0 eligible, 1 not eligible, 3 not validated -------------------------
 
-APPROVED = reply({"status": True, "nome": "MARIA", "dataExpiracao": "20270331"})
+APPROVED = reply(
+    {"status": True, "codigoRetorno": "1", "nome": "MARIA", "dataExpiracao": "20270331"}
+)
 NOT_FOUND = reply({"status": False, "codigoRetorno": "2"})
 FESN_UNKNOWN = reply({"name": "NotFoundError"}, 404)
 
@@ -212,8 +215,17 @@ FESN_UNKNOWN = reply({"name": "NotFoundError"}, 404)
         (reply({}), 3),  # a 200 that says nothing
         (reply({"status": False, "codigoRetorno": "99", "mensagem": "x"}), 3),  # unknown code
         (reply({"status": True, "codigoRetorno": "2", "dataExpiracao": "20270331"}), 3),
-        (reply({"status": True, "nome": "MARIA", "dataExpiracao": "20260930"}), 1),  # expired
-        (reply({"status": True, "nome": "MARIA"}), 1),  # no validity to judge by
+        (
+            reply(
+                {"status": True, "codigoRetorno": "1", "nome": "MARIA", "dataExpiracao": "20260930"}
+            ),
+            1,
+        ),  # expired
+        (
+            reply({"status": True, "codigoRetorno": "1", "nome": "MARIA"}),
+            1,
+        ),  # no validity to judge by
+        (reply({"status": True, "dataExpiracao": "20270331"}), 3),  # true status, no code at all
     ],
 )
 def test_dne_exit_codes(poc, monkeypatch, dne, expected):
@@ -357,3 +369,95 @@ def test_help_says_what_exit_3_covers():
 
 def test_help_limits_the_missing_credential_exit_to_the_dne_provider():
     assert "credencial ausente com --provedor dne" in run_cli("--help").stdout
+
+
+# --- the credential exit is the DNE provider's alone ---------------------------------------------------------
+
+
+def test_missing_credential_is_exit_2_only_with_the_dne_provider(poc, monkeypatch):
+    monkeypatch.delenv("MEIAENTRADA_CODIGO_ACESSO")
+    no_key = {"error": "meiaentrada-cie-validador requires env var MEIAENTRADA_CODIGO_ACESSO"}
+    fesn_argv = ["--provedor", "fesn", "--codigo-uso", "AB12CD34", "--data-evento", "2026-12-20"]
+    auto_argv = [
+        *["--provedor", "auto", "--data-evento", "2026-12-20"],
+        *dne_argv(codigo_uso="AB12CD34", nascimento="1990-01-01"),  # the FESN card's birth date
+    ]
+
+    gateway(monkeypatch, fesn=reply(FESN_CARD))  # FESN never needed it
+    assert poc.main(fesn_argv) == 0
+    gateway(monkeypatch, dne=no_key, fesn=reply(FESN_CARD))  # auto: the DNE leg fails, FESN decides
+    assert poc.main(auto_argv) == 0
+    gateway(monkeypatch, dne=no_key, fesn=FESN_UNKNOWN)
+    assert poc.main(auto_argv) == 3  # a failed leg, not bad input
+    gateway(monkeypatch)  # --provedor dne stops before any request
+    assert poc.main(["--provedor", "dne", *DNE_ARGS]) == 2
+
+
+# --- a stdout that fails with an I/O error must not turn our exit code into 120 -----------------------------
+
+
+class StdoutWithABrokenPipe:
+    """A stdout over a pipe nobody reads: write() or flush() fails with EPIPE."""
+
+    def __init__(self, fd, fail_on):
+        self.fd, self.fail_on = fd, fail_on
+
+    def _maybe_fail(self, operation):
+        if operation == self.fail_on:
+            raise BrokenPipeError(errno.EPIPE, "Broken pipe")
+
+    def write(self, text):
+        self._maybe_fail("write")
+        return len(text)
+
+    def flush(self):
+        self._maybe_fail("flush")
+
+    def fileno(self):
+        return self.fd
+
+
+@pytest.mark.parametrize("fail_on", ["write", "flush"])
+def test_broken_stdout_exits_3_and_points_its_fd_at_devnull(poc, monkeypatch, capsys, fail_on):
+    gateway(monkeypatch, dne=APPROVED)
+    reader, writer = os.pipe()
+    os.close(reader)  # nobody reads this pipe: writing to it fails with EPIPE
+    try:
+        monkeypatch.setattr(sys, "stdout", StdoutWithABrokenPipe(writer, fail_on))
+        argv = ["--provedor", "dne", "--data-evento", "2026-12-20", *DNE_ARGS]
+        assert poc.main(argv) == 3
+        assert "falha inesperada (BrokenPipeError)" in capsys.readouterr().err
+        # The interpreter flushes stdout once more at exit: that write must not fail again.
+        assert os.write(writer, b"x") == 1
+    finally:
+        os.close(writer)
+
+
+def test_a_flush_that_fails_is_part_of_the_run_not_of_the_shutdown(poc, monkeypatch, capsys):
+    """Buffered output only fails when flushed; the flush has to happen inside the try."""
+    gateway(monkeypatch, dne=NOT_FOUND)
+    monkeypatch.setattr(sys, "stdout", StdoutWithABrokenPipe(-1, "flush"))
+    assert poc.main(["--provedor", "dne", "--data-evento", "2026-12-20", *DNE_ARGS]) == 3
+    assert "falha inesperada (BrokenPipeError)" in capsys.readouterr().err
+
+
+def test_closed_stdout_pipe_exits_3_not_120():
+    """The real thing: the interpreter's flush at exit fails too, unless fd 1 was redirected."""
+    reader, writer = os.pipe()
+    os.close(reader)  # closed before the child starts: the first flush is guaranteed to fail
+    try:
+        env = {k: v for k, v in os.environ.items() if k != "MEIAENTRADA_CODIGO_ACESSO"}
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "--demo"],
+            check=False,
+            stdout=writer,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            env=env,
+        )
+    finally:
+        os.close(writer)
+    assert result.returncode == 3, result.stderr
+    assert "falha inesperada (BrokenPipeError)" in result.stderr
+    assert "Exception ignored" not in result.stderr

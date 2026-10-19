@@ -57,10 +57,12 @@ os dois: o fluxo trata ambos como pendência documental (no exit 3, depois de te
   ilegível. As datas são comparadas como datas, nunca como texto: como string,
   `20260930` ordena depois de `2026-12-20`.
 - **Validade.** É conferida contra a data do evento, não a da compra, e vale até o fim do
-  dia do vencimento. Sem data do evento, usa o dia de hoje em America/Sao_Paulo (depois das
-  21h em Brasília a data em UTC já é a do dia seguinte). O relógio é lido uma única vez por
-  consulta, antes de qualquer chamada de rede, e o mesmo dia vale para o DNE, para a FESN e
-  para a comparação da validade.
+  dia do vencimento. A validade é avaliada na data do evento informada, não em "hoje": um
+  evento no passado aceita uma carteirinha que já venceu hoje, por desenho; quem precisa de
+  validade corrente passa a data de hoje. Sem data do evento, usa o dia de hoje em
+  America/Sao_Paulo (depois das 21h em Brasília a data em UTC já é a do dia seguinte). O
+  relógio é lido uma única vez por consulta, antes de qualquer chamada de rede, e o mesmo dia
+  vale para o DNE, para a FESN e para a comparação da validade.
 - **Fail closed.** O que a decisão exige e não veio, ou não dá para ler, nunca aprova:
   validade ausente ou ilegível; na FESN, resposta com `useCode` diferente do consultado ou
   data de nascimento informada que ela não devolveu; HTTP fora de 2xx; resposta truncada
@@ -69,8 +71,10 @@ os dois: o fluxo trata ambos como pendência documental (no exit 3, depois de te
   são veredito. `1` com `status` verdadeiro aprova (se a validade cobrir o evento); `2`
   (documento não encontrado) é a única recusa conhecida; `5` é erro do nosso pedido e
   qualquer outro código é resposta não reconhecida, os dois como "não validado". Sem código,
-  só um `status` falso explícito é recusa. `status` verdadeiro com código diferente de `1`,
-  ou código `1` sem `status` verdadeiro, se contradiz e também é "não validado".
+  só um `status` falso explícito é recusa. `status` verdadeiro sem código está fora do
+  contrato (o catálogo diz que o DNE sempre envia o código); `status` verdadeiro com código
+  diferente de `1`, ou código `1` sem `status` verdadeiro, se contradiz. Os dois casos são
+  "não validado".
 - **O que é "não validado".** Erro de rede ou do gateway, HTTP fora de 2xx, resposta
   truncada, ilegível ou sem veredito (DNE sem `status` booleano nem `codigoRetorno`; FESN com
   200 sem o `useCode` consultado), código do DNE desconhecido ou contraditório e, na POC,
