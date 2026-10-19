@@ -445,3 +445,22 @@ def test_properties_named_like_schema_keywords_are_kept():
             "name": {"type": "string"},
         },
     }
+
+
+def test_a_property_called_properties_holds_a_schema_not_a_name_map():
+    schema = {
+        "type": "object",
+        "properties": {
+            "properties": {
+                "type": "object",
+                "example": {"dropped": True},
+                "properties": {"example": {"type": "string", "example": "x"}},
+            }
+        },
+    }
+    assert openapi._resolve({}, schema, depth=10) == {
+        "type": "object",
+        "properties": {
+            "properties": {"type": "object", "properties": {"example": {"type": "string"}}}
+        },
+    }
