@@ -45,7 +45,7 @@ apis:
     status: available
     auth: none
     base_url: https://api.bcb.gov.br/dados/serie
-    docs_url: https://dadosabertos.bcb.gov.br/dataset/20542-saldo-da-carteira-de-credito-com-recursos-livres---total
+    docs_url: https://dadosabertos.bcb.gov.br/
     description: >-
       Sistema Gerenciador de Séries Temporais: SELIC, IPCA, câmbio, crédito etc.
       Ex.: GET /bcdata.sgs.433/dados/ultimos/12?formato=json (433 = IPCA).
@@ -149,11 +149,14 @@ apis:
     status: unstable
     auth: none
     base_url: https://apitempo.inmet.gov.br
-    docs_url: https://portal.inmet.gov.br/manual/manual-de-uso-da-api-esta%C3%A7%C3%B5es
+    docs_url: https://portal.inmet.gov.br/
     description: >-
       Estações meteorológicas e dados horários/diários. Ex.: GET /estacoes/T (automáticas).
       Marcada unstable: não respondeu na verificação de 2026-08-07; disponibilidade oscila.
     tags: [meteorologia, clima, estacoes]
+    notes: >-
+      O portal do INMET não publica mais a página do manual da API (a anterior responde
+      404); docs_url aponta para a raiz do portal.
 
   - id: dados-gov-br
     name: dados.gov.br — API do Portal
