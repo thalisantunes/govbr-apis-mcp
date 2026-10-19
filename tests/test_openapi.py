@@ -7,7 +7,7 @@ import httpx
 import pytest
 
 from govbr_apis_mcp import openapi
-from govbr_apis_mcp.openapi import fetch_spec
+from govbr_apis_mcp.openapi import describe_operation, fetch_spec, summarize_spec
 
 SPEC_URL = "https://api.demo.gov.br/openapi.json"
 SPEC = {"openapi": "3.0.0", "info": {"title": "Demo", "version": "1"}, "paths": {}}
@@ -242,3 +242,206 @@ def test_cache_file_name_is_a_hash_inside_the_cache_dir(cache_home):
     path = openapi.cache_path("../../etc/passwd", SPEC_URL)
     assert path.parent == cache_home
     assert re.fullmatch(r"[0-9a-f]{64}\.json", path.name)
+
+
+# --- summarize_spec / describe_operation --------------------------------------------------
+
+
+def operation(spec, path, method):
+    return describe_operation(spec, path, method)["operations"][method.upper()]
+
+
+def test_summarize_survives_null_summary_and_description():
+    spec = {
+        "info": {"title": "T", "version": "1"},
+        "paths": {
+            "/a": {"get": {"summary": None, "description": None}},
+            "/b": {"get": {"description": "x" * 200}},
+            "/c": {"get": {"summary": "Short", "description": None}},
+        },
+    }
+    summaries = {op["path"]: op["summary"] for op in summarize_spec(spec)["operations"]}
+    assert summaries == {"/a": None, "/b": "x" * 120, "/c": "Short"}
+
+
+REF_PARAMS_SPEC = {
+    "openapi": "3.0.0",
+    "paths": {
+        "/items/{id}": {
+            "parameters": [{"$ref": "#/components/parameters/ItemId"}],
+            "get": {
+                "parameters": [
+                    {"$ref": "#/components/parameters/Limit"},
+                    {"$ref": "other.yaml#/parameters/Elsewhere"},
+                ],
+                "responses": {"200": {"description": "ok"}},
+            },
+        }
+    },
+    "components": {
+        "parameters": {
+            "ItemId": {
+                "name": "id",
+                "in": "path",
+                "required": True,
+                "description": "Item id",
+                "schema": {"type": "string"},
+            },
+            "Limit": {
+                "name": "limit",
+                "in": "query",
+                "schema": {"$ref": "#/components/schemas/Limit"},
+            },
+        },
+        "schemas": {"Limit": {"type": "integer", "maximum": 100}},
+    },
+}
+
+
+def test_parameter_refs_are_resolved_before_reading_name_and_location():
+    params = operation(REF_PARAMS_SPEC, "/items/{id}", "get")["parameters"]
+    by_name = {p["name"]: p for p in params if p["name"]}
+    assert by_name["id"]["in"] == "path"
+    assert by_name["id"]["required"] is True
+    assert by_name["id"]["description"] == "Item id"
+    assert by_name["id"]["schema"] == {"type": "string"}
+    assert by_name["limit"]["in"] == "query"
+    assert by_name["limit"]["schema"] == {"type": "integer", "maximum": 100}
+    assert len(params) == 3  # the pointer into another file is kept, just not resolvable
+
+
+def test_operation_parameter_replaces_the_inherited_one_with_the_same_name_and_location():
+    spec = {
+        "paths": {
+            "/x": {
+                "parameters": [
+                    {
+                        "name": "limit",
+                        "in": "query",
+                        "description": "path",
+                        "schema": {"type": "integer"},
+                    },
+                    {"name": "limit", "in": "header", "schema": {"type": "string"}},
+                    {"name": "id", "in": "path", "required": True, "schema": {"type": "string"}},
+                ],
+                "get": {
+                    "parameters": [
+                        {
+                            "name": "limit",
+                            "in": "query",
+                            "description": "op",
+                            "schema": {"type": "string"},
+                        }
+                    ]
+                },
+            }
+        }
+    }
+    params = operation(spec, "/x", "get")["parameters"]
+    by_key = {(p["name"], p["in"]): p for p in params}
+    assert len(params) == 3
+    assert set(by_key) == {("limit", "query"), ("limit", "header"), ("id", "path")}
+    assert by_key[("limit", "query")]["description"] == "op"
+    assert by_key[("limit", "query")]["schema"] == {"type": "string"}
+
+
+def test_null_parameter_lists_are_tolerated():
+    spec = {"paths": {"/x": {"parameters": None, "get": {"parameters": None}}}}
+    assert operation(spec, "/x", "get")["parameters"] == []
+
+
+PET = {"type": "object", "properties": {"name": {"type": "string"}}}
+SWAGGER_2_SPEC = {
+    "swagger": "2.0",
+    "paths": {
+        "/pets/{id}": {
+            "get": {
+                "parameters": [
+                    {
+                        "name": "id",
+                        "in": "path",
+                        "required": True,
+                        "type": "integer",
+                        "format": "int64",
+                    },
+                    {"name": "status", "in": "query", "type": "string", "enum": ["a", "b"]},
+                    {"name": "tags", "in": "query", "type": "array", "items": {"type": "string"}},
+                ],
+                "responses": {
+                    "200": {"description": "ok", "schema": {"$ref": "#/definitions/Pet"}},
+                    "404": {"description": "missing"},
+                },
+            },
+            "put": {
+                "parameters": [
+                    {"name": "id", "in": "path", "required": True, "type": "integer"},
+                    {
+                        "name": "body",
+                        "in": "body",
+                        "required": True,
+                        "schema": {"$ref": "#/definitions/Pet"},
+                    },
+                ],
+                "responses": {"204": {"description": "updated"}},
+            },
+        }
+    },
+    "definitions": {"Pet": PET},
+}
+
+
+def test_swagger_2_parameters_carry_their_type_on_the_parameter():
+    params = {p["name"]: p for p in operation(SWAGGER_2_SPEC, "/pets/{id}", "get")["parameters"]}
+    assert params["id"]["schema"] == {"type": "integer", "format": "int64"}
+    assert params["status"]["schema"] == {"type": "string", "enum": ["a", "b"]}
+    assert params["tags"]["schema"] == {"type": "array", "items": {"type": "string"}}
+
+
+def test_swagger_2_response_schema_sits_on_the_response():
+    assert operation(SWAGGER_2_SPEC, "/pets/{id}", "get")["response"] == PET
+
+
+def test_swagger_2_body_parameter_becomes_the_request_body():
+    put = operation(SWAGGER_2_SPEC, "/pets/{id}", "put")
+    assert put["requestBody"] == PET
+    assert [p["name"] for p in put["parameters"]] == ["id"]
+    assert operation(SWAGGER_2_SPEC, "/pets/{id}", "get")["requestBody"] is None
+
+
+def test_properties_named_like_schema_keywords_are_kept():
+    spec = {
+        "paths": {
+            "/x": {
+                "post": {
+                    "requestBody": {
+                        "content": {
+                            "application/json": {"schema": {"$ref": "#/components/schemas/Doc"}}
+                        }
+                    }
+                }
+            }
+        },
+        "components": {
+            "schemas": {
+                "Doc": {
+                    "type": "object",
+                    "example": {"example": "a sample, dropped"},
+                    "properties": {
+                        "example": {"type": "string", "example": "sample of a property"},
+                        "examples": {"type": "string"},
+                        "xml": {"type": "string", "xml": {"attribute": True}},
+                        "name": {"type": "string", "example": "Ana"},
+                    },
+                }
+            }
+        },
+    }
+    assert operation(spec, "/x", "post")["requestBody"] == {
+        "type": "object",
+        "properties": {
+            "example": {"type": "string"},
+            "examples": {"type": "string"},
+            "xml": {"type": "string"},
+            "name": {"type": "string"},
+        },
+    }

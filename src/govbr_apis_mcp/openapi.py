@@ -121,7 +121,7 @@ def summarize_spec(spec: dict[str, Any]) -> dict[str, Any]:
                 {
                     "method": method.upper(),
                     "path": path,
-                    "summary": op.get("summary") or op.get("description", "")[:120] or None,
+                    "summary": op.get("summary") or (op.get("description") or "")[:120] or None,
                 }
             )
     info = spec.get("info", {})
@@ -153,46 +153,92 @@ def describe_operation(spec: dict[str, Any], path: str, method: str | None) -> d
         op = methods.get(m)
         if op is None:
             raise KeyError(f"Method {m.upper()} not available for {path!r}")
-        params = [*shared_params, *op.get("parameters", [])]
+        params = _merge_params(spec, shared_params, op.get("parameters"))
+        body_param = next((p for p in params if p.get("in") == "body"), None)  # Swagger 2.0
         out["operations"][m.upper()] = {
             "summary": op.get("summary") or op.get("description"),
-            "parameters": [
-                {
-                    "name": p.get("name"),
-                    "in": p.get("in"),
-                    "required": p.get("required", False),
-                    "schema": _resolve(spec, p.get("schema"), depth=1),
-                    "description": (p.get("description") or "")[:200] or None,
-                }
-                for p in params
-            ],
-            "requestBody": _resolve(spec, _body_schema(op), depth=3),
+            "parameters": [_describe_param(spec, p) for p in params if p.get("in") != "body"],
+            "requestBody": _resolve(spec, _body_schema(op, body_param), depth=3),
             "response": _resolve(spec, _response_schema(op), depth=3),
         }
     return out
 
 
-def _body_schema(op: dict[str, Any]) -> dict[str, Any] | None:
+def _merge_params(spec: dict[str, Any], inherited: Any, own: Any) -> list[dict[str, Any]]:
+    """Path-level plus operation-level parameters, $refs followed. A parameter is
+    identified by (name, in): the operation's own declaration replaces the inherited one."""
+    merged: dict[tuple[Any, Any], dict[str, Any]] = {}
+    for raw in (*(inherited or []), *(own or [])):
+        param = _deref(spec, raw)
+        merged[(param.get("name"), param.get("in"))] = param
+    return list(merged.values())
+
+
+def _describe_param(spec: dict[str, Any], param: dict[str, Any]) -> dict[str, Any]:
+    schema = param.get("schema")
+    if schema is None:  # Swagger 2.0 declares the type on the parameter itself
+        schema = {k: param[k] for k in ("type", "format", "enum", "items") if k in param} or None
+    return {
+        "name": param.get("name"),
+        "in": param.get("in"),
+        "required": param.get("required", False),
+        "schema": _resolve(spec, schema, depth=1),
+        "description": (param.get("description") or "")[:200] or None,
+    }
+
+
+def _body_schema(op: dict[str, Any], body_param: dict[str, Any] | None) -> dict[str, Any] | None:
     content = (op.get("requestBody") or {}).get("content") or {}
     for media in ("application/json", *content):
         if media in content:
             return content[media].get("schema")
-    return None
+    return (body_param or {}).get("schema")  # Swagger 2.0: the body is a parameter
 
 
 def _response_schema(op: dict[str, Any]) -> dict[str, Any] | None:
     responses = op.get("responses") or {}
     for code in ("200", "201", "default", *responses):
         if code in responses:
-            content = (responses[code] or {}).get("content") or {}
+            response = responses[code] or {}
+            content = response.get("content") or {}
             for media in ("application/json", *content):
                 if media in content:
                     return content[media].get("schema")
+            if "schema" in response:  # Swagger 2.0 puts the schema on the response itself
+                return response["schema"]
     return None
 
 
-def _resolve(spec: dict[str, Any], schema: Any, depth: int) -> Any:
-    """Inline $refs to a limited depth so schemas are readable without the full spec."""
+def _lookup_ref(spec: dict[str, Any], ref: str) -> Any:
+    """Follow a local '#/a/b' JSON pointer; KeyError when it leads nowhere."""
+    if not ref.startswith("#/"):
+        raise KeyError(ref)
+    target: Any = spec
+    for part in ref[2:].split("/"):
+        key = part.replace("~1", "/").replace("~0", "~")
+        if not isinstance(target, dict) or key not in target:
+            raise KeyError(ref)
+        target = target[key]
+    return target
+
+
+def _deref(spec: dict[str, Any], node: Any) -> Any:
+    """Follow a node's own $ref (a parameter may point into components) without inlining
+    anything below it. A pointer that does not resolve leaves the node as it was."""
+    ref = node.get("$ref") if isinstance(node, dict) else None
+    if isinstance(ref, str):
+        try:
+            return _lookup_ref(spec, ref)
+        except KeyError:
+            pass
+    return node
+
+
+def _resolve(spec: dict[str, Any], schema: Any, depth: int, names: bool = False) -> Any:
+    """Inline $refs to a limited depth so schemas are readable without the full spec.
+
+    `names` marks a `properties` map, whose keys are property names rather than schema
+    keywords: a property called "example" must survive dropping example/examples/xml."""
     if schema is None:
         return None
     if depth < 0:
@@ -200,19 +246,15 @@ def _resolve(spec: dict[str, Any], schema: Any, depth: int) -> Any:
     if isinstance(schema, dict):
         ref = schema.get("$ref")
         if isinstance(ref, str):
-            if not ref.startswith("#/"):
+            try:
+                target = _lookup_ref(spec, ref)
+            except KeyError:
                 return {"unresolved_ref": ref}
-            target: Any = spec
-            for part in ref[2:].split("/"):
-                key = part.replace("~1", "/").replace("~0", "~")
-                if not isinstance(target, dict) or key not in target:
-                    return {"unresolved_ref": ref}
-                target = target[key]
             return _resolve(spec, target, depth - 1)
         return {
-            k: _resolve(spec, v, depth - 1)
+            k: _resolve(spec, v, depth - 1, names=k == "properties" and not names)
             for k, v in schema.items()
-            if k not in ("xml", "example", "examples")
+            if names or k not in ("xml", "example", "examples")
         }
     if isinstance(schema, list):
         return [_resolve(spec, item, depth - 1) for item in schema]
