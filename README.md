@@ -1,5 +1,7 @@
 # govbr-apis-mcp
 
+[![CI](https://github.com/thalisantunes/govbr-apis-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/thalisantunes/govbr-apis-mcp/actions/workflows/ci.yml)
+
 <!-- mcp-name: io.github.thalisantunes/govbr-apis-mcp -->
 
 MCP server that turns Brazilian government APIs into Claude-callable tools through a
@@ -89,6 +91,19 @@ To override entries without forking (e.g. filling in Conecta base URLs after adh
 point `GOVBR_EXTRA_CATALOG_DIR` at a directory whose same-id entries win.
 `GOVBR_CATALOG_DIR` replaces the base catalog entirely and should be treated as trusted
 input.
+
+## Development
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -e '.[dev]'
+.venv/bin/ruff check .
+.venv/bin/ruff format --check .
+.venv/bin/pytest
+```
+
+CI runs the same checks on Python 3.11–3.14. It also builds the wheel, installs it in a
+clean environment and loads the catalog from the installed package.
 
 ## Security notes
 
