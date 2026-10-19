@@ -5,6 +5,9 @@ disk (~/.cache/govbr-apis-mcp, 24h TTL) so describe_api stays cheap. Cache file
 names are hashes of the api id — never the id itself, which would let a catalog
 entry read or overwrite arbitrary .json files on disk.
 
+Redirects are followed by hand: every hop, the first URL included, must be https on
+an allowlisted host before it is requested, and bodies are capped at MAX_SPEC_BYTES.
+
 Summaries are deliberately compact: a full spec (Portal da Transparência's is
 ~185 KB) would crowd out the MCP client's context.
 """
@@ -24,6 +27,8 @@ import httpx
 from .catalog import host_allowed
 
 CACHE_TTL_SECONDS = 24 * 3600
+MAX_SPEC_BYTES = 5 * 1024 * 1024
+MAX_REDIRECTS = 5
 HTTP_METHODS = ("get", "post", "put", "patch", "delete")
 
 
@@ -46,13 +51,34 @@ def fetch_spec(api_id: str, openapi_url: str, client: httpx.Client) -> dict[str,
         except (json.JSONDecodeError, OSError):
             cache_file.unlink(missing_ok=True)  # corrupted cache repairs itself
 
-    resp = client.get(openapi_url, follow_redirects=True)
-    resp.raise_for_status()
-    if not host_allowed(str(resp.url)):
-        raise ValueError(f"Spec fetch for {api_id} redirected off-allowlist to {resp.url}")
-    spec = resp.json()
+    spec = json.loads(_download(api_id, openapi_url, client))
     _write_atomic(cache_file, json.dumps(spec))
     return spec
+
+
+def _download(api_id: str, url: str, client: httpx.Client) -> bytes:
+    """GET a spec, following redirects by hand so that every hop is checked before it is
+    requested, and reading at most MAX_SPEC_BYTES."""
+    current = httpx.URL(url)
+    for _ in range(MAX_REDIRECTS + 1):
+        if current.scheme != "https" or not host_allowed(str(current)):
+            raise ValueError(
+                f"Spec fetch for {api_id} refused {current}: spec and redirect URLs "
+                "must be https on an allowlisted host"
+            )
+        with client.stream("GET", current, follow_redirects=False) as resp:
+            if resp.next_request is None:
+                resp.raise_for_status()
+                body = bytearray()
+                for chunk in resp.iter_bytes():
+                    body += chunk
+                    if len(body) > MAX_SPEC_BYTES:
+                        raise ValueError(
+                            f"Spec fetch for {api_id}: spec too large (over {MAX_SPEC_BYTES} bytes)"
+                        )
+                return bytes(body)
+            current = resp.next_request.url
+    raise ValueError(f"Spec fetch for {api_id} followed more than {MAX_REDIRECTS} redirects")
 
 
 def _write_atomic(target: Path, content: str) -> None:
