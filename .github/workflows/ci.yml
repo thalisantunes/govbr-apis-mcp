@@ -53,7 +53,7 @@ jobs:
           python-version: "3.12"
       - run: python -m pip install build twine
       - run: python -m build
-      - run: python -m twine check dist/*
+      - run: python -m twine check --strict dist/*
       # Install only the wheel into a clean venv and run from outside the repo, so the
       # catalog can only come from the package data (not from the source tree). The
       # expected entry count is read from the source tree's YAML, so there is no number
@@ -80,7 +80,7 @@ jobs:
           # The smoke proves the wheel is self-sufficient: ignore operator overrides.
           for var in ("GOVBR_CATALOG_DIR", "GOVBR_EXTRA_CATALOG_DIR", "GOVBR_EXTRA_ALLOWED_HOSTS"):
               os.environ.pop(var, None)
-          # Explicit directory: a bare load() would obey GOVBR_CATALOG_DIR.
+          # Load the exact directory asserted below, not whatever a bare load() would pick.
           count = len(Catalog.load(DEFAULT_CATALOG_DIR).list())
           print(f"{count} entries loaded from {DEFAULT_CATALOG_DIR}; source tree has {expected}")
           assert "site-packages" in str(DEFAULT_CATALOG_DIR), "catalog did not come from the wheel"
