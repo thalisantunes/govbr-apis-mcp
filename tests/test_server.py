@@ -504,3 +504,175 @@ def test_list_apis_invalid_filter_explains(monkeypatch):
     monkeypatch.setattr(server, "_catalog", Catalog.load())
     out = server.list_apis(category="Public")
     assert "error" in out and "public" in out["valid_categories"]
+
+
+# --- _send: streaming, truncation, JSON fallback ---------------------------------------
+
+
+def send(url="https://x.gov.br/a"):
+    return server._send("GET", url, httpx.QueryParams(), None, httpx.Headers())
+
+
+def test_send_parses_json_bodies(wire):
+    wire(lambda request: httpx.Response(200, json={"a": 1}))
+    assert send() == {
+        "status": 200,
+        "url": "https://x.gov.br/a",
+        "content_type": "application/json",
+        "body": {"a": 1},
+    }
+
+
+def test_send_returns_other_content_types_as_text(wire):
+    wire(lambda request: httpx.Response(200, text="plain", headers={"content-type": "text/plain"}))
+    assert send()["body"] == "plain"
+
+
+def test_send_falls_back_to_text_when_json_does_not_parse(wire):
+    wire(
+        lambda request: httpx.Response(
+            200, text="<html>", headers={"content-type": "application/json"}
+        )
+    )
+    assert send()["body"] == {
+        "text": "<html>",
+        "parse_error": "content-type said JSON but body did not parse",
+    }
+
+
+@pytest.mark.parametrize("content_type", ["text/plain", "application/json"])
+def test_send_cuts_oversized_bodies_at_the_wire(content_type, wire):
+    """The response is read chunk by chunk and abandoned once past 60k chars."""
+    pulled = []
+
+    def chunks():
+        for index in range(1000):  # a megabyte on offer
+            pulled.append(index)
+            yield b"x" * 1000
+
+    wire(
+        lambda request: httpx.Response(
+            200, content=chunks(), headers={"content-type": content_type}
+        )
+    )
+    body = send()["body"]
+    assert body["truncated"] is True
+    assert len(body["text"]) == server.MAX_BODY_CHARS
+    assert "narrow it" in body["hint"]
+    assert len(pulled) < 100  # about 61 chunks were read, not all 1000
+
+
+@pytest.mark.parametrize(("size", "truncated"), [(60_000, False), (60_001, True)])
+def test_send_truncates_only_past_the_limit(size, truncated, wire):
+    wire(
+        lambda request: httpx.Response(200, text="x" * size, headers={"content-type": "text/plain"})
+    )
+    assert isinstance(send()["body"], dict) is truncated
+
+
+# --- describe_api ---------------------------------------------------------------------------
+
+SPEC = {
+    "info": {"title": "Demo", "version": "1"},
+    "paths": {"/things/{id}": {"get": {"summary": "Get a thing", "responses": {}}}},
+}
+
+
+def test_describe_api_summarizes_the_published_spec(catalog, monkeypatch):
+    fetched = []
+
+    def fake_fetch(api_id, openapi_url, client):
+        fetched.append((api_id, openapi_url, client))
+        return SPEC
+
+    monkeypatch.setattr(server, "fetch_spec", fake_fetch)
+    out = server.describe_api("camara-dados-abertos")
+    assert out["api"]["id"] == "camara-dados-abertos"
+    assert out["credentials"] == {"auth": "none", "env_vars": {}, "ready": True}
+    assert out["spec"]["operations"] == [
+        {"method": "GET", "path": "/things/{id}", "summary": "Get a thing"}
+    ]
+    assert fetched == [
+        (
+            "camara-dados-abertos",
+            "https://dadosabertos.camara.leg.br/api/v2/api-docs",
+            server._client,
+        )
+    ]
+
+
+def test_describe_api_with_a_path_describes_that_operation(catalog, monkeypatch):
+    monkeypatch.setattr(server, "fetch_spec", lambda *args: SPEC)
+    out = server.describe_api("camara-dados-abertos", path="/things/{id}", method="get")
+    assert out["spec"]["path"] == "/things/{id}"
+    assert out["spec"]["operations"]["GET"]["summary"] == "Get a thing"
+
+
+def test_describe_api_keeps_catalog_metadata_when_the_spec_fails(catalog, monkeypatch):
+    def unreachable(*args):
+        raise httpx.ConnectError("no route")
+
+    monkeypatch.setattr(server, "fetch_spec", unreachable)
+    out = server.describe_api("camara-dados-abertos")
+    assert out["spec_error"] == "ConnectError: no route"
+    assert out["api"]["id"] == "camara-dados-abertos"
+    assert "spec" not in out
+
+
+def test_describe_api_reports_a_path_that_is_not_in_the_spec(catalog, monkeypatch):
+    monkeypatch.setattr(server, "fetch_spec", lambda *args: SPEC)
+    out = server.describe_api("camara-dados-abertos", path="/nope")
+    assert out["spec_error"].startswith("KeyError") and "not in spec" in out["spec_error"]
+
+
+def test_describe_api_path_without_a_registered_spec(catalog):
+    out = server.describe_api("ibge-localidades", path="/estados")
+    assert "No OpenAPI spec registered" in out["spec_error"]
+
+
+def test_describe_api_without_spec_or_path_has_no_spec_keys(catalog):
+    out = server.describe_api("ibge-localidades")
+    assert "spec" not in out and "spec_error" not in out
+    assert out["api"]["id"] == "ibge-localidades"
+
+
+def test_describe_api_unknown_id(catalog):
+    assert "Unknown API id" in server.describe_api("nao-existe-xyz")["error"]
+
+
+# --- credentials_status ---------------------------------------------------------------
+
+
+def test_credentials_status_for_one_api(catalog, monkeypatch):
+    monkeypatch.delenv("TRANSPARENCIA_API_KEY", raising=False)
+    assert server.credentials_status("portal-transparencia") == [
+        {
+            "id": "portal-transparencia",
+            "status": "available",
+            "auth": "api_key",
+            "env_vars": {"TRANSPARENCIA_API_KEY": False},
+            "ready": False,
+            "callable": True,
+        }
+    ]
+    monkeypatch.setenv("TRANSPARENCIA_API_KEY", "x")
+    [item] = server.credentials_status("portal-transparencia")
+    assert item["ready"] is True
+
+
+def test_credentials_status_without_id_lists_entries_that_need_auth(catalog):
+    items = server.credentials_status()
+    ids = {item["id"] for item in items}
+    assert {"portal-transparencia", "datajud", "serpro-consulta-cnpj"} <= ids
+    assert "ibge-localidades" not in ids  # auth: none
+    assert all(catalog.get(i).auth != "none" and catalog.get(i).category != "conecta" for i in ids)
+
+
+def test_credentials_status_marks_stubs_as_not_callable(catalog):
+    [item] = server.credentials_status("conecta-consulta-cnpj")
+    assert item["callable"] is False
+
+
+def test_credentials_status_unknown_id(catalog):
+    [item] = server.credentials_status("nao-existe-xyz")
+    assert "Unknown API id" in item["error"]
