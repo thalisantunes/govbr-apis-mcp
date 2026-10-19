@@ -1,10 +1,12 @@
 """Catalog loading, validation and search.
 
-The catalog is a set of YAML files in the package's catalog_data/ directory. Each file has
-an `apis:` list; ids must be unique across files (a duplicate is an error, not a
-merge). GOVBR_EXTRA_CATALOG_DIR adds a second directory whose entries override
-same-id entries from the base catalog — that is the supported way to fill in
-credentials/base URLs (e.g. Conecta after adhesion) without forking the repo.
+The catalog is a set of YAML files (*.yaml or *.yml) in the package's catalog_data/
+directory. Each file has an `apis:` list; ids must be unique within a directory (a
+duplicate is an error, not a merge). GOVBR_EXTRA_CATALOG_DIR adds a second directory
+whose entries override same-id entries from the base catalog — that is the supported
+way to fill in credentials/base URLs (e.g. Conecta after adhesion) without forking
+the repo. An extra directory that does not exist or holds no entries is an error,
+not a silent no-op.
 
 Entries are validated on load: ids are filename-safe and every URL must be https
 on an allowlisted government host. The catalog decides where credentials are sent,
@@ -93,7 +95,7 @@ class ApiEntry:
 
     def validate(self, source: str) -> None:
         where = f"{source}:{self.id}"
-        if not ID_RE.match(self.id):
+        if not ID_RE.fullmatch(self.id):
             raise ValueError(
                 f"{where}: invalid id — must match {ID_RE.pattern} "
                 "(ids become cache lookup keys and must not contain path separators)"
@@ -124,8 +126,10 @@ class ApiEntry:
             raise ValueError(
                 f"{where}: auth_config.token_url not https/allowlisted ({token_url!r})"
             )
-        if self.auth == "api_key" and not self.auth_config.get("header"):
-            raise ValueError(f"{where}: auth=api_key requires auth_config.header")
+        if self.auth == "api_key":
+            for key in ("header", "env"):
+                if not self.auth_config.get(key):
+                    raise ValueError(f"{where}: auth=api_key requires auth_config.{key}")
         if self.auth == "oauth2_client_credentials" and self.callable and not token_url:
             raise ValueError(f"{where}: callable oauth2 entry requires auth_config.token_url")
         if self.status in ("available", "unstable") and not self.base_url:
@@ -170,19 +174,29 @@ class Catalog:
     @classmethod
     def load(cls, catalog_dir: str | Path | None = None) -> Catalog:
         base_dir = Path(catalog_dir or os.environ.get("GOVBR_CATALOG_DIR") or DEFAULT_CATALOG_DIR)
-        entries = cls._load_dir(base_dir, allow_override=False)
+        entries = cls._load_dir(base_dir)
         if not entries:
             raise FileNotFoundError(f"No catalog YAML files found in {base_dir}")
 
         extra_dir = os.environ.get("GOVBR_EXTRA_CATALOG_DIR")
         if extra_dir:
-            entries.update(cls._load_dir(Path(extra_dir), allow_override=True))
+            if not Path(extra_dir).is_dir():
+                raise ValueError(
+                    f"GOVBR_EXTRA_CATALOG_DIR={extra_dir!r} is not an existing directory"
+                )
+            extra = cls._load_dir(Path(extra_dir))
+            if not extra:
+                raise ValueError(
+                    f"GOVBR_EXTRA_CATALOG_DIR={extra_dir!r} has no catalog entries "
+                    "(expected *.yaml or *.yml files with an `apis:` list)"
+                )
+            entries.update(extra)  # same id: the extra entry wins
         return cls(entries)
 
     @staticmethod
-    def _load_dir(directory: Path, allow_override: bool) -> dict[str, ApiEntry]:
+    def _load_dir(directory: Path) -> dict[str, ApiEntry]:
         entries: dict[str, ApiEntry] = {}
-        for path in sorted(directory.glob("*.yaml")):
+        for path in sorted([*directory.glob("*.yaml"), *directory.glob("*.yml")]):
             data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
             for raw in data.get("apis", []):
                 try:
@@ -190,7 +204,7 @@ class Catalog:
                 except TypeError as exc:
                     raise ValueError(f"{path.name}: invalid entry fields — {exc}") from None
                 entry.validate(path.name)
-                if entry.id in entries and not allow_override:
+                if entry.id in entries:
                     raise ValueError(f"Duplicate API id {entry.id!r} in {path.name}")
                 entries[entry.id] = entry
         return entries
@@ -213,7 +227,9 @@ class Catalog:
             out = [e for e in out if e.category == category]
         if status:
             out = [e for e in out if e.status == status]
-        return sorted(out, key=lambda e: (e.category, e.id))
+        # Callable entries first: the ~95 Conecta stubs would otherwise fill the default
+        # page of list_apis and hide the few APIs that can actually be called.
+        return sorted(out, key=lambda e: (not e.callable, e.category, e.id))
 
     def search(self, query: str, category: str | None = None) -> list[ApiEntry]:
         """Accent-insensitive token search over name, id, provider, tags and description."""
