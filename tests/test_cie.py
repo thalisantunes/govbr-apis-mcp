@@ -552,3 +552,51 @@ def test_fesn_accepts_plain_use_codes_and_puts_them_in_the_path_as_is(codigo):
 
     check_fesn(codigo, caller=fake_call)
     assert seen["path"] == f"/api/students/usecode/{codigo}"
+
+
+# --- check_any: when every base fails, no provider owns the answer ----------------
+
+
+def dne_and_fesn(dne_response, fesn_response):
+    def fake_call(api_id, path, **kwargs):
+        return dne_response if api_id == "meiaentrada-cie-validador" else fesn_response
+
+    return fake_call
+
+
+DNE_NOT_FOUND = reply({"status": False, "codigoRetorno": "2"})
+FESN_NOT_FOUND = reply({"name": "NotFoundError"}, 404)
+
+
+def test_check_any_when_every_base_refuses_has_no_provider_and_both_reasons():
+    caller = dne_and_fesn(DNE_NOT_FOUND, FESN_NOT_FOUND)
+    d = check_any("X", "20000115", "e", "00000000000191", caller=caller)
+    assert not d.eligible and d.validated and d.provider is None
+    assert "DNE: documento não encontrado" in d.reason
+    assert "FESN: carteirinha não encontrada" in d.reason
+    assert "pendência documental" in d.reason
+    assert set(d.raw) == {"dne", "fesn"}  # each base keeps its own diagnosis
+
+
+def test_check_any_with_one_base_down_is_not_validated():
+    """DNE says "not found" but FESN did not answer: the card may well be in FESN."""
+    caller = dne_and_fesn(DNE_NOT_FOUND, reply("Bad Gateway", 502))
+    d = check_any("X", "20000115", "e", "00000000000191", caller=caller)
+    assert not d.eligible and not d.validated and d.provider is None
+    assert "DNE:" in d.reason and "FESN: validador não respondeu com HTTP 2xx" in d.reason
+
+
+def test_check_any_with_both_bases_down_is_not_validated_and_names_both():
+    caller = dne_and_fesn({"error": "ConnectError: dne"}, {"error": "ConnectError: fesn"})
+    d = check_any("X", "20000115", "e", "00000000000191", caller=caller)
+    assert not d.eligible and not d.validated and d.provider is None
+    assert "dne" in d.reason and "fesn" in d.reason
+
+
+def test_check_any_returns_the_dne_approval_without_asking_fesn():
+    def fake_call(api_id, path, **kwargs):
+        assert api_id == "meiaentrada-cie-validador"
+        return reply({"status": True, "nome": "MARIA", "dataExpiracao": "20270331"})
+
+    d = check_any("ABC", "20000115", "e", "00000000000191", "2026-12-20", fake_call)
+    assert d.eligible and d.provider == "dne"

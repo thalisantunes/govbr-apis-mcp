@@ -390,8 +390,9 @@ def check_any(
 
     A student whose card comes from a state entity or DCE is still entitled by law
     (Lei 12.933/2013); failing on the first base would deny a legitimate right. The
-    decision returned is the first approval, or the DNE failure with a note that the
-    other bases were checked too.
+    decision returned is the first approval. When every base fails, no base owns the
+    answer: `provider` is None, the reasons of all of them are joined, and the result is
+    "not validated" unless every base actually answered.
     """
     dne = check(codigo_uso, data_nascimento, nome_evento, cnpj_promotor, data_evento, caller)
     if dne.eligible:
@@ -401,9 +402,12 @@ def check_any(
     if fesn.eligible:
         return fesn
 
-    dne.reason = (
+    return CieDecision(
+        False,
         f"não validou em nenhuma base consultada (DNE: {dne.reason}; FESN: {fesn.reason}). "
-        "Existem emissoras sem API — trate como pendência documental, não como recusa."
+        "Existem emissoras sem API — trate como pendência documental, não como recusa.",
+        {},
+        {"dne": dne.raw, "fesn": fesn.raw},
+        None,
+        validated=dne.validated and fesn.validated,
     )
-    dne.validated = dne.validated and fesn.validated
-    return dne
