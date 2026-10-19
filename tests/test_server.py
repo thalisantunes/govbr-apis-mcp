@@ -5,7 +5,7 @@ import dataclasses
 import httpx
 import pytest
 
-from govbr_apis_mcp import auth, server
+from govbr_apis_mcp import __version__, auth, server
 from govbr_apis_mcp.catalog import ApiEntry, Catalog
 
 BASE = "https://api.portaldatransparencia.gov.br/api-de-dados"
@@ -302,6 +302,12 @@ def test_credentials_status_says_whether_call_api_accepts_the_entry(catalog, mon
         monkeypatch.setenv(var, "x")
     [item] = server.credentials_status(SERPRO_CNPJ)
     assert (item["ready"], item["callable"]) == (True, True)
+
+
+def test_reports_the_package_version():
+    """serverInfo.version used to reach the client empty, and the User-Agent said 0.2."""
+    assert server.mcp.version == __version__
+    assert server._client.headers["user-agent"] == f"govbr-apis-mcp/{__version__}"
 
 
 def test_call_api_unknown_id_returns_error_dict(monkeypatch):

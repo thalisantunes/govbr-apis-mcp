@@ -9,6 +9,7 @@ call to invoke it with the right auth profile.
 from __future__ import annotations
 
 import json
+import logging
 import posixpath
 import re
 from typing import Any
@@ -17,6 +18,7 @@ from urllib.parse import unquote
 import httpx
 from mcp.server.mcpserver import MCPServer
 
+from . import __version__
 from . import auth as auth_module
 from .catalog import CATEGORIES, STATUSES, ApiEntry, Catalog
 from .openapi import describe_operation, fetch_spec, summarize_spec
@@ -50,11 +52,11 @@ PROTECTED_HEADERS = frozenset(
 HEADER_NAME_RE = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")  # an RFC 9110 token
 HEADER_VALUE_RE = re.compile(r"[\t\x20-\x7e]*")  # printable ASCII: no CR, LF or NUL
 
-mcp = MCPServer("govbr-apis-mcp")
+mcp = MCPServer("govbr-apis-mcp", version=__version__)
 _catalog: Catalog | None = None
 # follow_redirects stays False: these requests carry credentials and must not be
 # steered to another host by a 3xx. Spec fetches (openapi.py) opt in explicitly.
-_client = httpx.Client(timeout=30, headers={"User-Agent": "govbr-apis-mcp/0.2"})
+_client = httpx.Client(timeout=30, headers={"User-Agent": f"govbr-apis-mcp/{__version__}"})
 
 
 def get_catalog() -> Catalog:
@@ -419,6 +421,10 @@ def _redact(url: str) -> str:
 
 
 def main() -> None:
+    # The SDK turns on INFO logging, and httpx then writes "HTTP Request: GET <url>" to
+    # stderr with the full query string, bypassing _redact.
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
     mcp.run()
 
 
