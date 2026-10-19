@@ -1,23 +1,27 @@
 """CIE (student card) eligibility check for half-price tickets.
 
-Thin business layer over the catalog entry `meiaentrada-cie-validador`: it turns the
-validator's raw payload into a decision a box office can act on, and keeps the quirks
-of that API in one place.
+Thin business layer over the catalog entries `meiaentrada-cie-validador` (DNE) and
+`fesn-cie-validador` (FESN): it turns each validator's raw payload into a decision a box
+office can act on, and keeps the quirks of those APIs in one place.
 
-Quirks worth knowing (verified 2026-08-07 against the live endpoint):
+Quirks worth knowing (verified 2026-08-07 against the live DNE endpoint):
 - Always HTTP 200, even on failure; the verdict is in `status` (bool or the *string*
   "true") and `codigoRetorno`.
 - `dataNascimento` must be YYYYMMDD — DDMMYYYY makes the server return HTTP 500.
 - codigoRetorno 5 means the request shape is wrong; 2 means the card does not exist.
   Confusing one for the other sends you debugging the wrong thing.
+- Since it answers 200 even when it fails, only the codes in RETURN_CODES are verdicts: 1
+  approves (with a true `status`), 2 is the one known refusal, 5 is our own request out of
+  contract. Any other code is an answer we do not recognize, so it is "not validated".
 
 Two rules hold for every issuer:
 - Fail closed: whatever a decision depends on (HTTP status, use code, expiry, birth date)
   must be present and readable, otherwise the card is not approved.
 - "Not validated" is not "refused": when there is no usable answer to decide on (network
-  or HTTP failure, truncated or unreadable body, a payload without a verdict, or one base
-  saying "not found" while another failed) the decision has validated=False and the caller
-  retries or asks for documents; it never denies on that alone.
+  or HTTP failure, truncated or unreadable body, a payload without a verdict or with an
+  unrecognized or contradictory one, or one base saying "not found" while another failed)
+  the decision has validated=False and the caller retries or asks for documents; it never
+  denies on that alone.
 """
 
 from __future__ import annotations
@@ -45,10 +49,11 @@ DATE_FORMATS = (
     (re.compile(r"(\d{2}/\d{2}/\d{4})", re.ASCII), "%d/%m/%Y"),
 )
 
-# Observed on the live API. Anything unmapped falls back to the API's own `mensagem`.
-# Code 2 is ambiguous by design: the API answers "documento inexistente" both for an
-# unknown codigoUso and for a real card whose dataNascimento does not match (verified
-# 2026-08-07 with a known-good card and a wrong birth date).
+# DNE return codes the layer understands, observed on the live API. The API answers HTTP 200
+# even when it fails, so only these are verdicts: any other code is an answer we do not
+# recognize, not a refusal. Code 2 is ambiguous by design: the API answers "documento
+# inexistente" both for an unknown codigoUso and for a real card whose dataNascimento does
+# not match (verified 2026-08-07 with a known-good card and a wrong birth date).
 RETURN_CODES = {
     "1": "documento válido",
     "2": "documento não encontrado — confira o código de uso E a data de nascimento; "
@@ -56,12 +61,15 @@ RETURN_CODES = {
     "5": "parâmetros inválidos (payload fora do contrato) — erro do nosso pedido, "
     "sem decisão sobre a carteirinha",
 }
+APPROVAL_CODE = "1"
+REFUSAL_CODES = ("2",)  # the one refusal the API is known to give for a card
 
 
 # Keys of a validator payload that carry no personal data. A refusal keeps only these in
 # `raw`: the rest (name, CPF, birth date, photo...) belongs to whoever holds the card, and
 # a caller who merely guessed a code or a birth date must not receive it.
 SAFE_RAW_KEYS = ("status", "codigoRetorno", "mensagem", "message", "dataExpiracao", "validity")
+MAX_TEXT = 200  # an issuer's free text is clipped to this many characters wherever we copy it
 
 
 class InvalidInput(ValueError):
@@ -93,12 +101,35 @@ class CieDecision:
         }
 
 
-def _refusal(
-    reason: str, payload: dict[str, Any], provider: str | None, validated: bool = True
-) -> CieDecision:
-    """A negative decision whose `raw` carries no personal data (see SAFE_RAW_KEYS)."""
-    safe = {k: payload[k] for k in SAFE_RAW_KEYS if k in payload}
-    return CieDecision(False, reason, {}, safe, provider, validated)
+def _clip(text: str, limit: int = MAX_TEXT) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _safe_raw(payload: dict[str, Any]) -> dict[str, Any]:
+    """The part of a validator payload that carries no personal data (see SAFE_RAW_KEYS).
+
+    Only scalar values survive and free text is clipped: an issuer's text can say anything.
+    """
+    safe: dict[str, Any] = {}
+    for key in SAFE_RAW_KEYS:
+        if key not in payload:
+            continue
+        value = payload[key]
+        if isinstance(value, str):
+            safe[key] = _clip(value)
+        elif value is None or isinstance(value, (bool, int, float)):
+            safe[key] = value
+    return safe
+
+
+def _refusal(reason: str, payload: dict[str, Any], provider: str | None) -> CieDecision:
+    """A refusal: a validator answered and the card does not qualify. No personal data in raw."""
+    return CieDecision(False, reason, {}, _safe_raw(payload), provider)
+
+
+def _unvalidated(reason: str, payload: dict[str, Any], provider: str | None) -> CieDecision:
+    """No usable answer to decide on (see CieDecision.validated). No personal data in raw."""
+    return CieDecision(False, reason, {}, _safe_raw(payload), provider, validated=False)
 
 
 def parse_date(value: Any) -> date | None:
@@ -162,31 +193,45 @@ def build_payload(
         "dataNascimento": normalize_date(data_nascimento, "dataNascimento"),
         "nomeEvento": (nome_evento or "").strip() or "evento",
         "dataEvento": normalize_date(data_evento, "dataEvento")
-        if data_evento
+        if data_evento is not None
         else today_br().strftime("%Y%m%d"),
         "cnpjPromotor": cnpj,
     }
 
 
 def interpret(payload: dict[str, Any], data_evento: str | None = None) -> CieDecision:
-    """Turn a validator response into an eligibility decision.
+    """Turn a DNE response into an eligibility decision.
 
     `dataExpiracao` is enforced here against the event date: whether the DNE API
     already accounts for the `dataEvento` we send is undocumented and unverified,
     so we never rely on it alone.
 
-    A payload is a verdict only if it carries a boolean `status` or a `codigoRetorno`, and
-    code 5 means our own request was out of contract. Neither says anything about the card,
-    so both come back as "not validated" instead of "not eligible".
+    Only a verdict on the card is a refusal. By `codigoRetorno` (see RETURN_CODES):
+    - 1 with a true `status` approves; without it the answer contradicts itself;
+    - 2 is the one refusal the API is known to give, and with no code an explicit false
+      `status` is one too;
+    - 5 is our own request out of contract and any other code is one we do not know: neither
+      says anything about the card;
+    - a true `status` with a code other than 1 contradicts itself, and a payload with neither
+      a boolean `status` nor a code says nothing.
+    Whatever is not a verdict on the card comes back "not validated", not "not eligible".
     """
     status = payload.get("status")
     approved = status is True or (isinstance(status, str) and status.lower() == "true")
     denied = status is False or (isinstance(status, str) and status.lower() == "false")
     raw_code = payload.get("codigoRetorno")
     code = None if raw_code in (None, "") else str(raw_code)
-    message = (payload.get("mensagem") or "").strip()
+    text = payload.get("mensagem")
+    message = _clip(text.strip()) if isinstance(text, str) else ""
 
     if approved:
+        if code not in (None, APPROVAL_CODE):
+            return _unvalidated(
+                f"veredito contraditório: status verdadeiro com codigoRetorno {_clip(code, 40)}, "
+                "sem decisão",
+                payload,
+                "dne",
+            )
         holder = {
             key: payload.get(key)
             for key in (
@@ -211,22 +256,40 @@ def interpret(payload: dict[str, Any], data_evento: str | None = None) -> CieDec
         )
         if problem:
             return _refusal(problem, payload, "dne")
-        return CieDecision(True, message or "CIE válida", holder, payload)
+        return CieDecision(True, message or "CIE válida", holder, payload, "dne")
 
-    reason = RETURN_CODES.get(code or "", message or "CIE não validada")
-    if code and code in RETURN_CODES and message and message not in reason:
-        reason = f"{reason} ({message})"
-    if code == "5":
-        return _refusal(reason, payload, None, validated=False)
-    if not (denied or code):
-        return _refusal(
+    if code is None:
+        if denied:
+            return _refusal(
+                message or "recusada pelo validador (status falso, sem codigoRetorno)",
+                payload,
+                "dne",
+            )
+        return _unvalidated(
             "resposta do validador sem veredito (sem status booleano nem codigoRetorno), "
             "sem decisão",
             payload,
-            None,
-            validated=False,
+            "dne",
         )
-    return _refusal(reason, payload, None)
+
+    known = RETURN_CODES.get(code)
+    extra = f" ({message})" if message and (known is None or message not in known) else ""
+    if code in REFUSAL_CODES:
+        return _refusal(f"{known}{extra}", payload, "dne")
+    if code == APPROVAL_CODE:
+        return _unvalidated(
+            f"codigoRetorno {code} ({known}) sem status verdadeiro: veredito contraditório, "
+            "sem decisão",
+            payload,
+            "dne",
+        )
+    if known:
+        return _unvalidated(f"{known}{extra}", payload, "dne")
+    return _unvalidated(
+        f"codigoRetorno {_clip(code, 40)} não reconhecido pelo validador{extra}, sem decisão",
+        payload,
+        "dne",
+    )
 
 
 def check(
@@ -240,22 +303,22 @@ def check(
     """Validate a CIE against the DNE base (UNE/UBES/ANPG) through the MCP gateway.
 
     `caller` defaults to the server's call_api, and exists so tests and the demo mode
-    can inject a stub without touching the network.
+    can inject a stub without touching the network. The clock is read here, once, before
+    the request: the day sent to the DNE is the day the card is judged against.
     """
-    body = build_payload(codigo_uso, data_nascimento, nome_evento, cnpj_promotor, data_evento)
+    event = expiry_reference(data_evento).isoformat()
+    body = build_payload(codigo_uso, data_nascimento, nome_evento, cnpj_promotor, event)
     if caller is None:
         from .server import call_api as caller  # imported lazily: avoids a cycle
 
     response = caller(API_ID, VALIDATOR_PATH, method="POST", body=body)
-    unvalidated = _unvalidated(response, "dne")
-    if unvalidated:
-        return unvalidated
-    decision = interpret(response["body"], data_evento)
-    decision.provider = "dne"
-    return decision
+    unusable = _unusable_response(response, "dne")
+    if unusable:
+        return unusable
+    return interpret(response["body"], event)
 
 
-def _unvalidated(response: dict[str, Any], provider: str) -> CieDecision | None:
+def _unusable_response(response: dict[str, Any], provider: str) -> CieDecision | None:
     """A "not validated" decision when the gateway response cannot support any verdict.
 
     The verdict is only read from a complete 2xx JSON object: an error page, a cut body
@@ -292,17 +355,18 @@ def _unvalidated(response: dict[str, Any], provider: str) -> CieDecision | None:
 FESN_API_ID = "fesn-cie-validador"
 FESN_PATH = "/api/students/usecode"
 # The use code is embedded in a URL path, so it must be a plain token: "/", "?", "#",
-# spaces or dot-only segments would change the resource FESN is asked about.
+# spaces or dot-only segments would change the resource FESN is asked about. That is a FESN
+# precondition only: the DNE takes the code in a JSON body and accepts any non-empty text.
 USE_CODE_RE = re.compile(r"(?!\.+$)[A-Za-z0-9._-]{1,64}")
 
 
 def _validate_fesn_input(
     codigo_uso: str, data_nascimento: str | None, data_evento: str | None
-) -> str:
-    """Check everything check_fesn takes from the caller, before any network call.
+) -> tuple[str, str]:
+    """Check what check_fesn takes from the caller, and read the clock, before any network call.
 
-    Returns the cleaned use code. A birth date that is supplied but empty is an error,
-    not a skipped check (None is how the caller says "no birth date").
+    Returns the cleaned use code and the event day (ISO). A birth date or an event date that
+    is supplied but empty is an error, not a skipped check; None is how a caller says "none".
     """
     code = (codigo_uso or "").strip()
     if not code:
@@ -314,9 +378,7 @@ def _validate_fesn_input(
         )
     if data_nascimento is not None:
         _require_date(data_nascimento, "dataNascimento")
-    if data_evento:
-        _require_date(data_evento, "dataEvento")
-    return code
+    return code, expiry_reference(data_evento).isoformat()
 
 
 def expiry_reference(data_evento: str | None) -> date:
@@ -325,7 +387,7 @@ def expiry_reference(data_evento: str | None) -> date:
     Checking against today lets a card expiring in September approve a ticket for a
     December show — buying early, not sophisticated fraud.
     """
-    if data_evento:
+    if data_evento is not None:
         return _require_date(data_evento, "dataEvento")
     return today_br()
 
@@ -367,12 +429,11 @@ def interpret_fesn(
     """
     returned = str(payload.get("useCode") or "").strip().casefold()
     if not returned or returned != codigo_uso.strip().casefold():
-        return _refusal(
+        return _unvalidated(
             "resposta da FESN não traz o código de uso consultado (ausente ou diferente), "
             "sem decisão",
             payload,
             "fesn",
-            validated=False,
         )
 
     expires = parse_date(payload.get("validity"))
@@ -416,14 +477,15 @@ def interpret_fesn(
 def check_fesn(
     codigo_uso: str,
     data_nascimento: str | None = None,
-    caller: Any = None,
     data_evento: str | None = None,
+    caller: Any = None,
 ) -> CieDecision:
     """Validate a CIE against the FESN base.
 
-    Raises InvalidInput, before any network call, for a malformed use code or date.
+    Raises InvalidInput, before any network call, for a malformed use code or date. The
+    clock is read before the request too, so a failure there never costs a request.
     """
-    code = _validate_fesn_input(codigo_uso, data_nascimento, data_evento)
+    code, event = _validate_fesn_input(codigo_uso, data_nascimento, data_evento)
     if caller is None:
         from .server import call_api as caller
 
@@ -440,10 +502,10 @@ def check_fesn(
         return CieDecision(
             False, "carteirinha não encontrada na base FESN", {}, {"status": 404}, "fesn"
         )
-    unvalidated = _unvalidated(response, "fesn")
-    if unvalidated:
-        return unvalidated
-    return interpret_fesn(body, data_nascimento, data_evento, codigo_uso=code)
+    unusable = _unusable_response(response, "fesn")
+    if unusable:
+        return unusable
+    return interpret_fesn(body, data_nascimento, event, codigo_uso=code)
 
 
 def check_any(
@@ -460,24 +522,43 @@ def check_any(
     (Lei 12.933/2013); failing on the first base would deny a legitimate right. The
     decision returned is the first approval. When every base fails, no base owns the
     answer: `provider` is None, the reasons of all of them are joined, and the result is
-    "not validated" unless every base actually answered. The input of every base is
-    validated before the first network call, so InvalidInput never discards a verdict.
+    "not validated" unless every base actually answered.
+
+    What every base needs (use code, dates, CNPJ) is validated before the first network
+    call, and the clock is read once, so the same day is used for both bases. A use code
+    that is not a FESN path token is not an error: the FESN leg is skipped, saying so, and
+    the DNE verdict stands.
     """
-    _validate_fesn_input(codigo_uso, data_nascimento, data_evento)
-    dne = check(codigo_uso, data_nascimento, nome_evento, cnpj_promotor, data_evento, caller)
+    event = expiry_reference(data_evento).isoformat()
+    dne = check(codigo_uso, data_nascimento, nome_evento, cnpj_promotor, event, caller)
     if dne.eligible:
         return dne
 
-    fesn = check_fesn(codigo_uso, data_nascimento, caller, data_evento)
-    if fesn.eligible:
-        return fesn
+    code = codigo_uso.strip()  # not empty: check() would have raised
+    if USE_CODE_RE.fullmatch(code):
+        fesn = check_fesn(code, data_nascimento, event, caller)
+        if fesn.eligible:
+            return fesn
+        fesn_reason, fesn_raw, fesn_answered = fesn.reason, fesn.raw, fesn.validated
+    else:
+        fesn_reason = (
+            "não consultada: o código não é um useCode FESN "
+            "(1 a 64 letras, dígitos, '.', '_' ou '-')"
+        )
+        fesn_raw, fesn_answered = {}, True  # a base that does not apply leaves nothing missing
 
+    validated = dne.validated and fesn_answered
+    if validated:
+        head = "as bases consultadas responderam que a carteirinha não vale"
+        tail = "Existem emissoras sem API — trate como pendência documental, não como recusa."
+    else:
+        head = "sem decisão: faltou resposta utilizável de pelo menos uma base consultada"
+        tail = "Tente de novo ou trate como pendência documental, não como recusa."
     return CieDecision(
         False,
-        f"não validou em nenhuma base consultada (DNE: {dne.reason}; FESN: {fesn.reason}). "
-        "Existem emissoras sem API — trate como pendência documental, não como recusa.",
+        f"{head} (DNE: {dne.reason}; FESN: {fesn_reason}). {tail}",
         {},
-        {"dne": dne.raw, "fesn": fesn.raw},
+        {"dne": dne.raw, "fesn": fesn_raw},
         None,
-        validated=dne.validated and fesn.validated,
+        validated=validated,
     )

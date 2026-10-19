@@ -39,12 +39,18 @@ def reply(body, status=200):
     return {"status": status, "url": "https://example.invalid/x", "body": body}
 
 
+class UnexpectedGatewayCall(BaseException):
+    """Not an Exception on purpose: the POC turns every Exception into exit 3, which would
+    hide a call that must not happen behind a test that expects exit 3."""
+
+
 def gateway(monkeypatch, dne=None, fesn=None):
     """Replace server.call_api; a base left as None must never be called."""
 
     def call_api(api_id, path, **kwargs):
         response = dne if api_id == DNE else fesn
-        assert response is not None, f"unexpected call to {api_id}"
+        if response is None:
+            raise UnexpectedGatewayCall(api_id)
         return response
 
     monkeypatch.setattr(server, "call_api", call_api)
@@ -143,13 +149,16 @@ def test_dne_without_credential_exits_2(poc, monkeypatch, capsys):
     [
         (["--provedor", "dne", *dne_argv(nascimento="20261399")], "dataNascimento"),
         (["--provedor", "dne", *dne_argv(cnpj="123")], "cnpjPromotor"),
-        (["--provedor", "auto", *dne_argv(codigo_uso="AB/12")], "codigoUso"),
         (["--provedor", "fesn", "--codigo-uso", "AB/12"], "codigoUso"),
         (["--provedor", "fesn", "--codigo-uso", "AB12CD34", "--nascimento", ""], "dataNascimento"),
         (
             ["--provedor", "fesn", "--codigo-uso", "AB12CD34", "--data-evento", "2026-13-45"],
             "dataEvento",
         ),
+        (["--provedor", "fesn", "--codigo-uso", "AB12CD34", "--data-evento", ""], "dataEvento"),
+        (["--provedor", "fesn", "--codigo-uso", "AB12CD34", "--data-evento", "  "], "dataEvento"),
+        (["--provedor", "dne", *dne_argv(), "--data-evento", ""], "dataEvento"),
+        (["--provedor", "auto", *dne_argv(), "--data-evento", ""], "dataEvento"),
     ],
 )
 def test_invalid_input_exits_2_names_the_field_and_never_reaches_the_gateway(
@@ -201,6 +210,10 @@ FESN_UNKNOWN = reply({"name": "NotFoundError"}, 404)
         (reply({"text": "x", "truncated": True}), 3),
         (reply({"status": False, "codigoRetorno": "5"}), 3),  # our payload out of contract
         (reply({}), 3),  # a 200 that says nothing
+        (reply({"status": False, "codigoRetorno": "99", "mensagem": "x"}), 3),  # unknown code
+        (reply({"status": True, "codigoRetorno": "2", "dataExpiracao": "20270331"}), 3),
+        (reply({"status": True, "nome": "MARIA", "dataExpiracao": "20260930"}), 1),  # expired
+        (reply({"status": True, "nome": "MARIA"}), 1),  # no validity to judge by
     ],
 )
 def test_dne_exit_codes(poc, monkeypatch, dne, expected):
@@ -245,3 +258,102 @@ def test_not_validated_is_labelled_and_serialised_as_such(poc, monkeypatch, caps
 
     assert poc.main(["--provedor", "dne", *DNE_ARGS]) == 3
     assert "NAO VALIDADO" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "fesn,extra,expected",
+    [
+        (reply(FESN_CARD), [], 0),
+        (reply({**FESN_CARD, "validity": "2026-09-30 23:59:59"}), [], 1),  # gone before the event
+        (reply(FESN_CARD), ["--nascimento", "1990-01-02"], 1),  # birth date does not match
+        (
+            reply({k: v for k, v in FESN_CARD.items() if k != "birth"}),
+            ["--nascimento", "1990-01-01"],
+            1,  # FESN gave no birth date to compare
+        ),
+        (FESN_UNKNOWN, [], 1),
+        (reply("<html>WAF</html>", 404), [], 3),
+        (reply({"name": "NotFoundError"}), [], 3),
+        (reply("Bad Gateway", 502), [], 3),
+    ],
+)
+def test_fesn_exit_codes(poc, monkeypatch, fesn, extra, expected):
+    gateway(monkeypatch, fesn=fesn)
+    argv = ["--provedor", "fesn", "--codigo-uso", "AB12CD34", "--data-evento", "2026-12-20"]
+    assert poc.main([*argv, *extra]) == expected
+
+
+# --- in auto, a code that is not a FESN token still gets the DNE's answer ------------------------------------
+
+
+@pytest.mark.parametrize("dne,expected", [(APPROVED, 0), (NOT_FOUND, 1), ({"error": "boom"}, 3)])
+def test_auto_with_a_code_that_is_not_a_fesn_token_asks_only_dne(poc, monkeypatch, dne, expected):
+    gateway(monkeypatch, dne=dne)  # asking FESN would raise
+    argv = ["--provedor", "auto", "--data-evento", "2026-12-20", *dne_argv(codigo_uso="AB/12")]
+    assert poc.main(argv) == expected
+
+
+# --- what the CLI sends to the DNE ------------------------------------------------------------------------
+
+
+def test_event_name_cnpj_and_date_reach_the_dne_request(poc, monkeypatch):
+    seen = {}
+
+    def call_api(api_id, path, method=None, body=None, **kwargs):
+        seen["body"] = body
+        return NOT_FOUND
+
+    monkeypatch.setattr(server, "call_api", call_api)
+    argv = ["--provedor", "dne", "--evento", "Show Z", "--data-evento", "2026-12-20", *DNE_ARGS]
+    assert poc.main(argv) == 1
+    assert seen["body"]["nomeEvento"] == "Show Z"
+    assert seen["body"]["dataEvento"] == "20261220"
+    assert seen["body"]["cnpjPromotor"] == "00000000000191"
+
+
+# --- the output phase is part of the run: a failure there is exit 3, not a traceback ------------------------
+
+
+class StdoutThatCannotEncode:
+    """A stdout whose encoding has no em dash, like the reasons carry."""
+
+    def write(self, text):
+        raise UnicodeEncodeError("latin-1", text, 0, 1, "ordinal not in range(256)")
+
+    def flush(self):
+        pass
+
+
+@pytest.mark.parametrize("flags", [[], ["--json"]])
+def test_failure_while_printing_a_decision_exits_3(poc, monkeypatch, capsys, flags):
+    gateway(monkeypatch, dne=APPROVED)
+    monkeypatch.setattr(sys, "stdout", StdoutThatCannotEncode())
+    argv = ["--provedor", "dne", "--data-evento", "2026-12-20", *DNE_ARGS, *flags]
+    assert poc.main(argv) == 3
+    assert "falha inesperada (UnicodeEncodeError)" in capsys.readouterr().err
+
+
+def test_failure_while_printing_the_demo_exits_3(poc, monkeypatch, capsys):
+    monkeypatch.setattr(sys, "stdout", StdoutThatCannotEncode())
+    assert poc.main(["--demo"]) == 3
+    assert "falha inesperada (UnicodeEncodeError)" in capsys.readouterr().err
+
+
+# --- --help ----------------------------------------------------------------------------------------------------
+
+
+def test_help_keeps_the_example_command_on_its_two_lines():
+    """The docstring is shown as is; without a raw string the trailing backslash is eaten."""
+    result = run_cli("--help")
+    assert result.returncode == 0
+    assert "--nascimento 1999-04-21 \\\n" in result.stdout
+
+
+def test_help_says_what_exit_3_covers():
+    helptext = run_cli("--help").stdout
+    for fragment in ("exceção inesperada", "codigoRetorno 5 ou desconhecido", "sem veredito"):
+        assert fragment in helptext
+
+
+def test_help_limits_the_missing_credential_exit_to_the_dne_provider():
+    assert "credencial ausente com --provedor dne" in run_cli("--help").stdout

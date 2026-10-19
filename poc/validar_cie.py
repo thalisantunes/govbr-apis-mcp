@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""POC: valida meia-entrada de estudante (CIE) na compra ou na portaria.
+r"""POC: valida meia-entrada de estudante (CIE) na compra ou na portaria.
 
 Uso real (precisa de MEIAENTRADA_CODIGO_ACESSO e de uma CIE de verdade):
 
@@ -7,16 +7,17 @@ Uso real (precisa de MEIAENTRADA_CODIGO_ACESSO e de uma CIE de verdade):
         --evento "Show X" --cnpj 00.000.000/0001-91
 
 Sem credencial nem carteirinha à mão, o modo demo roda a mesma validação (cie.check)
-com respostas de exemplo no lugar da chamada de rede (as recusas foram gravadas da API
-real; a aprovação é sintética):
+com respostas de exemplo no lugar da chamada de rede (as respostas negativas foram
+gravadas da API real; a aprovação é sintética):
 
     python poc/validar_cie.py --demo
 
 Exit code: 0 elegível; 1 não elegível (os validadores responderam e a carteirinha não
-vale); 2 entrada inválida ou credencial ausente; 3 não validado (faltou resposta utilizável
-para decidir: rede ou gateway, HTTP fora de 2xx, resposta truncada, ilegível ou sem
-veredito; em auto, também quando uma base não encontrou a carteirinha e a outra falhou).
-O 3 nunca é recusa: tente de novo ou peça comprovação documental.
+vale); 2 entrada inválida, ou credencial ausente com --provedor dne; 3 não validado
+(faltou resposta utilizável para decidir: rede ou gateway, HTTP fora de 2xx, resposta
+truncada, ilegível ou sem veredito, codigoRetorno 5 ou desconhecido, exceção inesperada,
+inclusive ao imprimir; em auto, também quando uma base não encontrou a carteirinha e a
+outra falhou). O 3 nunca é recusa: tente de novo ou peça comprovação documental.
 """
 
 from __future__ import annotations
@@ -87,11 +88,15 @@ def render(decision, titulo: str) -> None:
         print(f"  {key}: {value}")
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--codigo-uso", help="código de uso da CIE (o que vem no QR code)")
+    parser.add_argument(
+        "--codigo-uso",
+        help="código de uso da CIE (o que vem no QR code); em auto, a FESN só é consultada se "
+        "ele for um token de 1 a 64 letras, dígitos, '.', '_' ou '-'",
+    )
     parser.add_argument(
         "--nascimento",
         help="data de nascimento do portador (YYYY-MM-DD); obrigatória no DNE, "
@@ -102,7 +107,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--data-evento",
         help="data do evento (YYYY-MM-DD); a validade da carteirinha é conferida contra ela. "
-        "Padrão: hoje (America/Sao_Paulo)",
+        "Padrão: hoje (America/Sao_Paulo); informá-la vazia é erro",
     )
     parser.add_argument(
         "--provedor",
@@ -112,8 +117,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--demo", action="store_true", help="roda com respostas gravadas, sem rede")
     parser.add_argument("--json", action="store_true", help="saída em JSON")
-    args = parser.parse_args(argv)
+    return parser
 
+
+def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """Everything after the arguments are parsed, output included."""
     if args.demo:
         decisions = {
             name: check(
@@ -156,24 +164,17 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    try:
-        if args.provedor == "fesn":
-            decision = check_fesn(args.codigo_uso, args.nascimento, data_evento=args.data_evento)
-        else:
-            runner = check if args.provedor == "dne" else check_any
-            decision = runner(
-                codigo_uso=args.codigo_uso,
-                data_nascimento=args.nascimento,
-                nome_evento=args.evento,
-                cnpj_promotor=args.cnpj,
-                data_evento=args.data_evento,
-            )
-    except InvalidInput as exc:
-        print(f"entrada inválida: {exc}", file=sys.stderr)
-        return 2
-    except Exception as exc:  # noqa: BLE001 — a crash is not a verdict on the card
-        print(f"falha inesperada ({type(exc).__name__}): {exc}", file=sys.stderr)
-        return 3
+    if args.provedor == "fesn":
+        decision = check_fesn(args.codigo_uso, args.nascimento, data_evento=args.data_evento)
+    else:
+        runner = check if args.provedor == "dne" else check_any
+        decision = runner(
+            codigo_uso=args.codigo_uso,
+            data_nascimento=args.nascimento,
+            nome_evento=args.evento,
+            cnpj_promotor=args.cnpj,
+            data_evento=args.data_evento,
+        )
 
     if args.json:
         print(json.dumps(decision.as_dict(), ensure_ascii=False, indent=2))
@@ -182,6 +183,19 @@ def main(argv: list[str] | None = None) -> int:
     if not decision.validated:
         return 3
     return 0 if decision.eligible else 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return run(args, parser)
+    except InvalidInput as exc:
+        print(f"entrada inválida: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001 — a crash is not a verdict on the card
+        print(f"falha inesperada ({type(exc).__name__}): {exc}", file=sys.stderr)
+        return 3
 
 
 if __name__ == "__main__":
