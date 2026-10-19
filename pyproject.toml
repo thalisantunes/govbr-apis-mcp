@@ -4,10 +4,10 @@ version = "0.1.0"
 description = "MCP server exposing Brazilian government APIs (public, Serpro commercial and Conecta gov.br) through a spec-driven gateway"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Thalis Antunes" }]
 classifiers = [
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.11",
@@ -38,7 +38,7 @@ Issues = "https://github.com/thalisantunes/govbr-apis-mcp/issues"
 govbr-apis-mcp = "govbr_apis_mcp.server:main"
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]

@@ -49,17 +49,29 @@ jobs:
       - run: python -m build
       - run: python -m twine check dist/*
       # Install only the wheel into a clean venv and run from outside the repo, so the
-      # catalog can only come from the package data (not from the source tree).
+      # catalog can only come from the package data (not from the source tree). The
+      # expected entry count is read from the source tree's YAML, so there is no number
+      # to keep in sync.
       - name: Smoke-test the wheel
         working-directory: ${{ runner.temp }}
         run: |
           python -m venv wheel-venv
           wheel-venv/bin/pip install "$GITHUB_WORKSPACE"/dist/*.whl
           wheel-venv/bin/python -I - <<'PY'
+          import os
+          from pathlib import Path
+
+          import yaml
+
           from govbr_apis_mcp.catalog import DEFAULT_CATALOG_DIR, Catalog
 
-          EXPECTED_ENTRIES = 116  # bump when the catalog grows or shrinks
+          tree = Path(os.environ["GITHUB_WORKSPACE"]) / "src/govbr_apis_mcp/catalog"
+          expected = sum(
+              len((yaml.safe_load(path.read_text(encoding="utf-8")) or {}).get("apis", []))
+              for path in tree.glob("*.yaml")
+          )
           count = len(Catalog.load().list())
-          print(f"{count} entries loaded from {DEFAULT_CATALOG_DIR}")
-          assert count == EXPECTED_ENTRIES, f"expected {EXPECTED_ENTRIES} entries, got {count}"
+          print(f"{count} entries loaded from {DEFAULT_CATALOG_DIR}; source tree has {expected}")
+          assert "site-packages" in str(DEFAULT_CATALOG_DIR), "catalog did not come from the wheel"
+          assert count == expected, f"wheel has {count} entries, source tree has {expected}"
           PY
