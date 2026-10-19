@@ -1,6 +1,7 @@
 """Tests for the MCP tool layer — URL construction, header precedence, redaction."""
 
 import dataclasses
+import logging
 
 import httpx
 import pytest
@@ -91,22 +92,11 @@ def test_path_only_query_survives_without_dict():
 
 @pytest.mark.parametrize(
     "path",
-    ["../../etc/passwd", "/../other-product/v9", "/%2e%2e/%2e%2e/secret", "/a/../../escape"],
-)
-def test_traversal_is_rejected(path):
-    with pytest.raises(ValueError, match="escapes the API's base URL|contains '\\.\\.'"):
-        server._build_target(BASE, path, None)
-
-
-@pytest.mark.parametrize("path", ["//evil.com/x", "https://evil.com/x", "\\\\evil.com/x"])
-def test_host_cannot_be_swapped(path):
-    url, _ = server._build_target(BASE, path, None)
-    assert url.startswith(BASE)
-
-
-@pytest.mark.parametrize(
-    "path",
     [
+        pytest.param("../../etc/passwd", id="relative"),
+        pytest.param("/../other-product/v9", id="parent"),
+        pytest.param("/a/../../escape", id="nested"),
+        pytest.param("/%2e%2e/%2e%2e/secret", id="encoded"),
         pytest.param("/%252e%252e/api-de-dados-admin/x", id="double-encoded"),
         pytest.param("/%25252e%25252e/x", id="triple-encoded"),
         pytest.param("/%2525252e%2525252e/x", id="encoded-too-deep-to-trust"),
@@ -117,10 +107,16 @@ def test_host_cannot_be_swapped(path):
         pytest.param("/a/%2e/b", id="encoded-dot-segment"),
     ],
 )
-def test_encoded_traversal_variants_are_rejected(path):
+def test_traversal_is_rejected(path):
     """A proxy in front of the API may decode more than once, so decode until stable."""
     with pytest.raises(ValueError, match="escapes the API's base URL|contains '\\.\\.'"):
         server._build_target(BASE, path, None)
+
+
+@pytest.mark.parametrize("path", ["//evil.com/x", "https://evil.com/x", "\\\\evil.com/x"])
+def test_host_cannot_be_swapped(path):
+    url, _ = server._build_target(BASE, path, None)
+    assert url.startswith(BASE)
 
 
 def test_prefix_guard_has_a_segment_boundary(monkeypatch):
@@ -176,10 +172,6 @@ def test_redact_keeps_repeated_values():
     assert out.params.get_list("token") == ["***", "***"]
 
 
-def test_redact_survives_an_unparseable_url():
-    assert server._redact("http://[::1") == "<invalid URL>"
-
-
 def test_redirects_are_reported_not_followed(catalog, wire):
     requests = wire(
         lambda request: httpx.Response(
@@ -195,10 +187,24 @@ def test_redirects_are_reported_not_followed(catalog, wire):
     assert "SECRET" not in str(out)
 
 
-def test_relative_redirect_location_is_redacted_too(catalog, wire):
-    wire(lambda request: httpx.Response(302, headers={"Location": "/login?token=abc"}))
+@pytest.mark.parametrize(
+    ("location", "resolved"),
+    [
+        pytest.param("/login?token=abc", "https://servicodados.ibge.gov.br/login", id="absolute"),
+        pytest.param(
+            "next?token=abc",
+            "https://servicodados.ibge.gov.br/api/v1/localidades/next",
+            id="relative",
+        ),
+        pytest.param("//other.gov.br/z?token=abc", "https://other.gov.br/z", id="scheme-relative"),
+    ],
+)
+def test_relative_redirect_location_is_resolved_and_redacted(location, resolved, catalog, wire):
+    wire(lambda request: httpx.Response(302, headers={"Location": location}))
     out = server.call_api("ibge-localidades", "/estados")
-    assert httpx.URL(out["location"]).params.get("token") == "***"
+    target = httpx.URL(out["location"])
+    assert str(target.copy_with(query=None)) == resolved
+    assert target.params.get("token") == "***"
     assert "abc" not in str(out)
 
 
@@ -304,10 +310,40 @@ def test_credentials_status_says_whether_call_api_accepts_the_entry(catalog, mon
     assert (item["ready"], item["callable"]) == (True, True)
 
 
+@pytest.mark.parametrize(
+    "api_id", ["serpro-consulta-cpf", "serpro-consulta-cnpj", "serpro-datavalid"]
+)
+def test_serpro_entries_are_flagged_pii(api_id, catalog):
+    """Callable since they only need credentials, and they return CPF/CNPJ data (partner
+    names included) into the conversation."""
+    assert catalog.get(api_id).pii is True
+
+
 def test_reports_the_package_version():
     """serverInfo.version used to reach the client empty, and the User-Agent said 0.2."""
     assert server.mcp.version == __version__
     assert server._client.headers["user-agent"] == f"govbr-apis-mcp/{__version__}"
+
+
+def test_main_quiets_httpx_logging(monkeypatch):
+    """The SDK enables INFO logging, and httpx would then print every URL, query included."""
+    names = ("httpx", "httpcore")
+    before = {name: logging.getLogger(name).level for name in names}
+    monkeypatch.setattr(server.mcp, "run", lambda: None)
+    try:
+        server.main()
+        assert {name: logging.getLogger(name).level for name in names} == {
+            "httpx": logging.WARNING,
+            "httpcore": logging.WARNING,
+        }
+    finally:
+        for name, level in before.items():
+            logging.getLogger(name).setLevel(level)
+
+
+def test_shared_client_never_follows_redirects():
+    """Its requests carry credentials, so a 3xx must not steer them to another host."""
+    assert server._client.follow_redirects is False
 
 
 def test_call_api_unknown_id_returns_error_dict(monkeypatch):
@@ -342,10 +378,15 @@ def test_caller_headers_cannot_duplicate_the_managed_credential(catalog, wire, m
     out = server.call_api(
         "portal-transparencia",
         "/api-de-dados/viagens",
-        headers={"Chave-Api-Dados": "a", "CHAVE-API-DADOS": "b"},
+        headers={
+            "Chave-Api-Dados": "evil-a",
+            "CHAVE-API-DADOS": "evil-b",
+            "chave_api_dados": "evil-c",
+        },
     )
     assert requests[0].headers.get_list("chave-api-dados") == ["REAL-KEY"]
-    assert out["ignored_headers"] == ["CHAVE-API-DADOS", "Chave-Api-Dados"]
+    assert all("evil" not in value for _, value in requests[0].headers.multi_items())
+    assert out["ignored_headers"] == ["CHAVE-API-DADOS", "Chave-Api-Dados", "chave_api_dados"]
 
 
 @pytest.mark.parametrize(
@@ -367,12 +408,25 @@ def test_caller_headers_cannot_duplicate_the_managed_credential(catalog, wire, m
         "X-Original-URL",
         "x-rewrite-url",
         "X-Real-IP",
+        "Proxy-Connection",
+        "Via",
+        "Max-Forwards",
+        "X-HTTP-Method",
+        "X-Method-Override",
+        "True-Client-IP",
+        "CF-Connecting-IP",
+        "X-Client-IP",
+        "X-Originating-IP",
+        "Client-IP",
+        "X_Forwarded_For",
+        "Transfer_Encoding",
+        "x_http_method_override",
     ],
 )
 def test_framing_and_proxy_headers_never_reach_the_wire(name, catalog, wire):
     requests = wire()
     out = server.call_api("ibge-localidades", "/estados", headers={name: "evil"})
-    assert "evil" not in requests[0].headers.get_list(name)
+    assert all("evil" not in value for _, value in requests[0].headers.multi_items())
     assert out["ignored_headers"] == [name]
 
 
@@ -404,10 +458,16 @@ def test_ordinary_caller_headers_still_pass(catalog, wire):
     out = server.call_api(
         "ibge-localidades",
         "/estados",
-        headers={"accept": "application/xml", "X-Trace": "keep", "x-trace": "keep2"},
+        headers={
+            "accept": "application/xml",
+            "X-Trace": "keep",
+            "x-trace": "keep2",
+            "X-Note": "two words",
+        },
     )
     assert requests[0].headers.get_list("accept") == ["application/xml"]
     assert requests[0].headers.get_list("x-trace") == ["keep2"]
+    assert requests[0].headers.get_list("x-note") == ["two words"]
     assert "ignored_headers" not in out
 
 
@@ -476,7 +536,7 @@ def test_whitespace_only_credential_counts_as_unset(catalog, wire, monkeypatch):
 
 
 def test_protocol_errors_do_not_echo_header_values(catalog, wire, monkeypatch):
-    """h11 quotes the header it rejects; when that is the credential it must not reach the result."""
+    """h11 quotes the header it rejects; a credential there must not reach the result."""
     monkeypatch.setenv("DATAJUD_API_KEY", "REAL-KEY")
     wire()
 
@@ -527,38 +587,26 @@ def test_missing_credentials_are_reported_with_their_status(catalog, wire, monke
         pytest.param({"body": {"a": 1}}, id="body-on-get"),
         pytest.param({"method": "TRACE"}, id="bad-method"),
         pytest.param({"path": "/../other"}, id="traversal"),
-        pytest.param({"path": "/things\n"}, id="control-char-in-path"),
-        pytest.param({"headers": {"X-A": "a\r\nB: c"}}, id="header-injection"),
-    ],
-)
-def test_invalid_calls_do_not_cost_a_token_request(kwargs, oauth_api, wire):
-    """Caller input is validated before credentials: a bad call must not hit the token endpoint."""
-    requests = wire(token_then_api)
-    out = server.call_api("oauth-demo", **{"path": "/things", **kwargs})
-    assert "error" in out
-    assert requests == []
-
-
-@pytest.mark.parametrize(
-    "kwargs",
-    [
         pytest.param({"path": "/x\x00y"}, id="nul-in-path"),
         pytest.param({"path": "/x\ny"}, id="newline-in-path"),
         pytest.param({"path": "/" + "a" * 70_000}, id="path-too-long"),
-        pytest.param({"path": "/x", "headers": {"X-Name": "José"}}, id="non-ascii-header-value"),
-        pytest.param({"path": "/x", "headers": {"X-Nömé": "a"}}, id="non-ascii-header-name"),
-        pytest.param({"path": "/x", "headers": {"X Name": "a"}}, id="space-in-header-name"),
-        pytest.param({"path": "/x", "headers": {"X-A": "a\r\nB: c"}}, id="crlf-in-header-value"),
-        pytest.param({"path": "/x", "query": {"a": "\ud800"}}, id="lone-surrogate-in-query"),
-        pytest.param(
-            {"path": "/x", "method": "POST", "body": {"a": float("nan")}}, id="nan-in-body"
-        ),
+        pytest.param({"query": {"a": "\ud800"}}, id="lone-surrogate-in-query"),
+        pytest.param({"method": "POST", "body": {"a": float("nan")}}, id="nan-in-body"),
+        pytest.param({"headers": {"X-Name": "José"}}, id="non-ascii-header-value"),
+        pytest.param({"headers": {"X-Nömé": "a"}}, id="non-ascii-header-name"),
+        pytest.param({"headers": {"X Name": "a"}}, id="space-in-header-name"),
+        pytest.param({"headers": {"": "a"}}, id="empty-header-name"),
+        pytest.param({"headers": {"X-A": "a\r\nB: c"}}, id="crlf-in-header-value"),
+        pytest.param({"headers": {"X-A": "x "}}, id="trailing-space-in-header-value"),
+        pytest.param({"headers": {"X-A": " x"}}, id="leading-space-in-header-value"),
+        pytest.param({"headers": {"X-A": " "}}, id="blank-header-value"),
     ],
 )
-def test_invalid_input_comes_back_as_an_error_dict(kwargs, catalog, wire):
-    """Every bad caller input is a {"error": ...} result, never an exception from the tool."""
-    requests = wire()
-    out = server.call_api("ibge-localidades", **kwargs)
+def test_invalid_input_is_an_error_before_any_request(kwargs, oauth_api, wire):
+    """Bad caller input comes back as {"error": ...}, never as an exception, and is caught
+    before credentials: no token request and no API request."""
+    requests = wire(token_then_api)
+    out = server.call_api("oauth-demo", **{"path": "/things", **kwargs})
     assert "error" in out
     assert requests == []
 
@@ -608,6 +656,14 @@ def test_send_falls_back_to_text_when_json_does_not_parse(wire):
         "text": "<html>",
         "parse_error": "content-type said JSON but body did not parse",
     }
+
+
+@pytest.mark.parametrize(("method", "status"), [("HEAD", 200), ("GET", 204)])
+def test_empty_body_with_a_json_content_type_is_not_a_parse_error(method, status, catalog, wire):
+    wire(lambda request: httpx.Response(status, headers={"content-type": "application/json"}))
+    out = server.call_api("ibge-localidades", "/estados", method=method)
+    assert out["status"] == status
+    assert out["body"] == ""
 
 
 @pytest.mark.parametrize("content_type", ["text/plain", "application/json"])

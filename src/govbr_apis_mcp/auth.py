@@ -22,8 +22,9 @@ import httpx
 
 from .catalog import ApiEntry
 
-# What a header value may hold on the wire: printable ASCII, so no CR, LF or NUL.
-HEADER_VALUE_RE = re.compile(r"[\t\x20-\x7e]*")
+# A header value we are willing to send: printable ASCII (so no CR, LF or NUL) with no
+# whitespace at either end, which h11 refuses.
+HEADER_VALUE_RE = re.compile(r"(?:[\x21-\x7e](?:[\t\x20-\x7e]*[\x21-\x7e])?)?")
 
 
 class MissingCredentialsError(Exception):
@@ -84,11 +85,19 @@ def _api_key_headers(entry: ApiEntry) -> dict[str, str]:
 
 
 def _oauth2_token(entry: ApiEntry, client: httpx.Client) -> str:
+    # One lock around check, request and store: concurrent callers share a single token request.
     with _token_lock:
         cached = _token_cache.get(entry.id)
-    if cached and cached[1] > time.monotonic():
-        return cached[0]
+        if cached and cached[1] > time.monotonic():
+            return cached[0]
+        token, ttl = _request_token(entry, client)
+        if ttl > 60:  # short-lived tokens are not cached — serving an expired one is worse
+            _token_cache[entry.id] = (token, time.monotonic() + ttl - 30)
+        return token
 
+
+def _request_token(entry: ApiEntry, client: httpx.Client) -> tuple[str, int]:
+    """Fetch a token; returns it with its lifetime in seconds (0 when the endpoint gives none)."""
     cfg = entry.auth_config
     id_var, secret_var = cfg.get("client_id_env"), cfg.get("client_secret_env")
     if not id_var or not secret_var or not cfg.get("token_url"):
@@ -104,8 +113,8 @@ def _oauth2_token(entry: ApiEntry, client: httpx.Client) -> str:
             f"{entry.id} requires env vars {id_var} and {secret_var} (status: {entry.status})."
         )
 
-    basic = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
     try:
+        basic = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
         resp = client.post(
             cfg["token_url"],
             data={"grant_type": "client_credentials"},
@@ -114,21 +123,28 @@ def _oauth2_token(entry: ApiEntry, client: httpx.Client) -> str:
         resp.raise_for_status()
         payload = resp.json()
         token = payload["access_token"]
-        if not token or not isinstance(token, str):
+        if not isinstance(token, str) or not token.strip():
             raise KeyError("access_token")
-        ttl = int(payload.get("expires_in", 300))
     except httpx.HTTPStatusError as exc:
         status = exc.response.status_code
         raise TokenError(f"{entry.id}: token endpoint returned HTTP {status}") from None
     except httpx.HTTPError as exc:
         raise TokenError(f"{entry.id}: token request failed ({type(exc).__name__})") from None
+    except httpx.InvalidURL:
+        raise TokenError(f"{entry.id}: token_url is not a valid URL") from None
+    except UnicodeEncodeError:  # a non-UTF-8 byte in a credential env var
+        raise TokenError(
+            f"{entry.id}: client credentials contain characters that cannot be encoded"
+        ) from None
     except (ValueError, KeyError, TypeError):
         raise TokenError(f"{entry.id}: token endpoint returned no access_token") from None
+    token = token.strip()
     if not HEADER_VALUE_RE.fullmatch(token):
         raise TokenError(
             f"{entry.id}: token endpoint returned an access_token with invalid characters"
         )
-    if ttl > 60:  # short-lived tokens are not cached — serving an expired one is worse
-        with _token_lock:
-            _token_cache[entry.id] = (token, time.monotonic() + ttl - 30)
-    return token
+    try:
+        ttl = int(float(payload.get("expires_in", 300)))
+    except (TypeError, ValueError, OverflowError):
+        ttl = 0  # lifetime unknown: the token is used this once and not cached
+    return token, ttl

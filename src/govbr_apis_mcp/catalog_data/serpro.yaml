@@ -8,6 +8,7 @@ apis:
     category: serpro
     status: requires_contract
     auth: oauth2_client_credentials
+    pii: true
     auth_config:
       token_url: https://gateway.apiserpro.serpro.gov.br/token
       client_id_env: SERPRO_CPF_CLIENT_ID
@@ -26,6 +27,7 @@ apis:
     category: serpro
     status: requires_contract
     auth: oauth2_client_credentials
+    pii: true
     auth_config:
       token_url: https://gateway.apiserpro.serpro.gov.br/token
       client_id_env: SERPRO_CNPJ_CLIENT_ID
@@ -43,6 +45,7 @@ apis:
     category: serpro
     status: requires_contract
     auth: oauth2_client_credentials
+    pii: true
     auth_config:
       token_url: https://gateway.apiserpro.serpro.gov.br/token
       client_id_env: SERPRO_DATAVALID_CLIENT_ID

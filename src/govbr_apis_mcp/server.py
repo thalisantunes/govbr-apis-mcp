@@ -29,10 +29,11 @@ SENSITIVE_PARAM_HINTS = ("key", "token", "secret", "senha", "password", "chave")
 ALLOWED_METHODS = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
 # Headers the caller may not set: they would override the catalog-managed credential,
 # redirect the request to another virtual host, tamper with its framing, make a proxy in
-# front of the API route or rewrite it differently, or defeat the response size cut
-# (Accept-Encoding stays "identity" so streaming really stops at MAX_BODY_CHARS instead
-# of after inflating a compressed chunk). X-Forwarded-* is matched by prefix and the
-# entry's own credential header is added per call.
+# front of the API route, rewrite or re-method the request, or vouch for the client's IP,
+# or defeat the response size cut (Accept-Encoding stays "identity" so streaming really
+# stops at MAX_BODY_CHARS instead of after inflating a compressed chunk). X-Forwarded-*
+# is matched by prefix and the entry's own credential header is added per call. Names are
+# compared with '_' read as '-', as CGI/WSGI/PHP backends do.
 PROTECTED_HEADERS = frozenset(
     {
         "authorization",
@@ -49,9 +50,19 @@ PROTECTED_HEADERS = frozenset(
         "forwarded",
         "accept-encoding",
         "x-http-method-override",
+        "x-http-method",
+        "x-method-override",
         "x-original-url",
         "x-rewrite-url",
         "x-real-ip",
+        "x-client-ip",
+        "x-originating-ip",
+        "true-client-ip",
+        "cf-connecting-ip",
+        "client-ip",
+        "proxy-connection",
+        "via",
+        "max-forwards",
     }
 )
 HEADER_NAME_RE = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")  # an RFC 9110 token
@@ -59,7 +70,7 @@ HEADER_NAME_RE = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")  # an RFC 9110 token
 mcp = MCPServer("govbr-apis-mcp", version=__version__)
 _catalog: Catalog | None = None
 # follow_redirects stays False: these requests carry credentials, so a 3xx must not steer them.
-# Spec fetches (openapi.py) follow up to 5 hops by hand, vetting https and the allowlist first.
+# Redirect handling for spec fetches lives in openapi.py.
 _client = httpx.Client(timeout=30, headers={"User-Agent": f"govbr-apis-mcp/{__version__}"})
 
 
@@ -163,23 +174,17 @@ def call_api(
     body: dict[str, Any] | None = None,
     headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Call an endpoint of a catalog API, resolving base URL and auth automatically.
+    """Call an endpoint of a catalog API; base URL and credentials are resolved for you.
 
-    `path` is appended to the API's base_url (e.g. '/estados/mg' for ibge-localidades)
-    and may carry its own query string, which is merged with `query`: a key in `query`
-    replaces that key in the path, and a list value repeats it (`{"uf": ["SP", "RJ"]}`).
-    It cannot escape the base URL's prefix. `method` is GET, HEAD, POST, PUT, PATCH,
-    DELETE or OPTIONS. `body` is sent as JSON — only use it with methods that accept a
-    payload (POST/PUT/PATCH). `headers` adds request headers; credentials, Host and
-    connection-framing headers are managed by the gateway, and any you send come back
-    listed in `ignored_headers`. A requires_contract API (Serpro) is accepted once its
-    credential env vars are set.
+    `path` is relative to the API's base_url (e.g. '/estados/mg') and may carry a query
+    string; `query` overrides its keys, and a list value repeats a key. `method` is GET,
+    HEAD, POST, PUT, PATCH, DELETE or OPTIONS; send `body` (JSON) only with POST/PUT/PATCH.
+    Credential, Host, proxy and framing headers in `headers` are dropped and listed in
+    `ignored_headers`.
 
-    Returns {status, url, body}; JSON bodies come back parsed, others as text,
-    truncated at 60k chars. Redirects are not followed: a 3xx result carries the target
-    in `location`, to call yourself if it is on the same API. Entries flagged
-    `pii: true` return personal data (CPF/CNPJ) into this conversation — call those
-    only when the user asked for it.
+    Returns {status, url, body} (JSON parsed, text cut at 60k chars); a 3xx is not followed
+    and carries its absolute `location`. Problems come back as {error}. Entries flagged
+    `pii: true` return personal data (CPF/CNPJ): call them only when the user asked.
     """
     try:
         entry = get_catalog().get(api_id)
@@ -289,23 +294,29 @@ def _caller_headers(
     """Gateway default headers plus the caller's, minus the protected ones.
 
     httpx.Headers compares names case-insensitively, so `Chave-Api-Dados` and
-    `CHAVE-API-DADOS` cannot both ride along next to the managed credential. Returns
-    the headers and the sorted names that were ignored; a header httpx or the wire
-    would refuse raises ValueError.
+    `CHAVE-API-DADOS` cannot both ride along next to the managed credential; `_` is read
+    as `-` too. Returns the headers and the sorted names that were ignored; a header
+    httpx or the wire would refuse raises ValueError.
     """
     merged = httpx.Headers({"Accept": "application/json", "Accept-Encoding": "identity"})
-    managed = (entry.auth_config.get("header") or "").lower()
+    managed = (entry.auth_config.get("header") or "").lower().replace("_", "-")
     ignored: list[str] = []
     for name, value in (headers or {}).items():
-        lowered = name.lower()
-        if lowered in PROTECTED_HEADERS or lowered.startswith("x-forwarded-") or lowered == managed:
+        if not HEADER_NAME_RE.fullmatch(name):
+            raise ValueError(f"header name {name!r} is not valid — it must be an HTTP token.")
+        canonical = name.lower().replace("_", "-")
+        if (
+            canonical in PROTECTED_HEADERS
+            or canonical.startswith("x-forwarded-")
+            or canonical == managed
+        ):
             ignored.append(name)
-        elif HEADER_NAME_RE.fullmatch(name) and auth_module.HEADER_VALUE_RE.fullmatch(value):
+        elif auth_module.HEADER_VALUE_RE.fullmatch(value):
             merged[name] = value
         else:
             raise ValueError(
-                f"header {name!r} is not valid — names must be HTTP tokens and "
-                "values printable ASCII (no line breaks)."
+                f"header {name!r} has an invalid value — printable ASCII, no line breaks "
+                "and no whitespace at either end."
             )
     return merged, sorted(ignored)
 
@@ -334,8 +345,9 @@ def _build_target(
     like PTAX's "/CotacaoDolarDia(dataCotacao=@d)?@d='08-06-2026'" would silently
     lose its parameter. The two are merged as httpx.QueryParams, which keeps repeated
     keys (?uf=SP&uf=RJ); a key in `query` replaces the embedded one entirely.
-    Traversal is rejected by looking for dot segments under every decoding a proxy
-    chain might apply, then checking the normalized URL still sits under the base prefix.
+    Traversal is rejected by looking for dot segments under up to three decodings (a
+    proxy chain may decode more than once), then checking the normalized URL still sits
+    under the base prefix.
     """
     raw_path, _, embedded = path.partition("?")
     if _has_dot_segment(raw_path):
@@ -392,7 +404,7 @@ def _send(
             "truncated": True,
             "hint": "Response exceeded 60k chars — narrow it with query filters or pagination.",
         }
-    elif "json" in (content_type or ""):
+    elif text and "json" in (content_type or ""):  # an empty body (HEAD, 204) is not bad JSON
         try:
             parsed = json.loads(text)
         except json.JSONDecodeError:
@@ -408,17 +420,17 @@ def _send(
     }
     location = resp.headers.get("location")
     if location and 300 <= resp.status_code < 400:
-        result["location"] = _redact(location)
+        try:
+            result["location"] = _redact(str(resp.url.join(location)))
+        except httpx.InvalidURL:  # httpx only vets Location on 301/302/303/307/308
+            result["location"] = "<invalid URL>"
     return result
 
 
 def _redact(url: str) -> str:
     """Blank out query values whose name suggests a credential, so the echoed URL
     never carries a key into the transcript."""
-    try:
-        parsed = httpx.URL(url)
-    except httpx.InvalidURL:  # a server-supplied Location can be anything
-        return "<invalid URL>"
+    parsed = httpx.URL(url)
     if not parsed.query:
         return url
     safe = [

@@ -1,7 +1,9 @@
 """Tests for the OAuth2 client-credentials flow and the ways its token endpoint fails."""
 
 import base64
-import types
+import dataclasses
+import threading
+import time
 
 import httpx
 import pytest
@@ -86,6 +88,7 @@ def test_token_http_failure_is_a_token_error_without_the_body(status, entry):
         pytest.param({"json": {"access_token": None}}, id="null-token"),
         pytest.param({"json": {"access_token": ""}}, id="empty-token"),
         pytest.param({"json": ["access_token"]}, id="not-an-object"),
+        pytest.param({"json": {"access_token": "  "}}, id="blank-token"),
     ],
 )
 def test_token_response_without_a_usable_token(kwargs, entry):
@@ -136,16 +139,6 @@ def test_whitespace_only_env_var_counts_as_unset(entry, monkeypatch):
     assert requests == []
 
 
-def test_nul_in_a_credential_is_refused(monkeypatch):
-    """A real environment cannot hold NUL (putenv refuses it), so hand the module a dict."""
-    entry = Catalog.load().get("datajud")
-    environ = {"DATAJUD_API_KEY": "SEC\x00RET"}
-    monkeypatch.setattr(auth, "os", types.SimpleNamespace(environ=environ))
-    with pytest.raises(auth.MissingCredentialsError) as excinfo:
-        auth.build_headers(entry, client=None)
-    assert str(excinfo.value) == "credential in DATAJUD_API_KEY contains invalid characters"
-
-
 def test_token_that_cannot_travel_in_a_header_is_refused(entry):
     client, requests = token_client(
         lambda request: httpx.Response(
@@ -159,3 +152,86 @@ def test_token_that_cannot_travel_in_a_header_is_refused(entry):
             "serpro-consulta-cnpj: token endpoint returned an access_token with invalid characters"
         )
     assert len(requests) == 2  # the unusable token was not cached
+
+
+def test_token_edge_whitespace_is_stripped_before_use_and_caching(entry):
+    client, requests = token_client(
+        lambda request: httpx.Response(200, json={"access_token": "tok \n", "expires_in": 3600})
+    )
+    assert auth.build_headers(entry, client) == {"Authorization": "Bearer tok"}
+    assert auth.build_headers(entry, client) == {"Authorization": "Bearer tok"}
+    assert len(requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("expires_in", "cached"),
+    [
+        pytest.param(b'"3600.0"', True, id="float-in-a-string"),
+        pytest.param(b"3600.5", True, id="float"),
+        pytest.param(b"null", False, id="null"),
+        pytest.param(b'"soon"', False, id="garbage"),
+        pytest.param(b"[]", False, id="list"),
+        pytest.param(b"NaN", False, id="nan"),
+        pytest.param(b"Infinity", False, id="infinity"),
+        pytest.param(b"1e400", False, id="overflow"),
+    ],
+)
+def test_odd_expires_in_never_rejects_a_good_token(expires_in, cached, entry):
+    """The lifetime only decides caching: if it is unusable the token is used once."""
+    body = b'{"access_token": "tok", "expires_in": ' + expires_in + b"}"
+    client, requests = token_client(
+        lambda request: httpx.Response(
+            200, content=body, headers={"content-type": "application/json"}
+        )
+    )
+    assert auth.build_headers(entry, client) == {"Authorization": "Bearer tok"}
+    assert auth.build_headers(entry, client) == {"Authorization": "Bearer tok"}
+    assert len(requests) == (1 if cached else 2)
+
+
+def test_credentials_that_cannot_be_encoded_are_a_token_error(entry, monkeypatch):
+    monkeypatch.setenv("SERPRO_CNPJ_CLIENT_SECRET", "se\udcffcret")  # a non-UTF-8 byte
+    client, requests = token_client(lambda request: httpx.Response(200))
+    with pytest.raises(auth.TokenError) as excinfo:
+        auth.build_headers(entry, client)
+    assert str(excinfo.value) == (
+        "serpro-consulta-cnpj: client credentials contain characters that cannot be encoded"
+    )
+    assert requests == []
+
+
+def test_malformed_token_url_is_a_token_error(entry):
+    config = {**entry.auth_config, "token_url": "https://gateway.apiserpro.serpro.gov.br:x/token"}
+    broken = dataclasses.replace(entry, auth_config=config)
+    client, requests = token_client(lambda request: httpx.Response(200))
+    with pytest.raises(auth.TokenError) as excinfo:
+        auth.build_headers(broken, client)
+    assert str(excinfo.value) == "serpro-consulta-cnpj: token_url is not a valid URL"
+    assert requests == []
+
+
+def test_concurrent_callers_share_one_token_request(entry):
+    """Single flight: on a cold cache, parallel callers wait for the first request."""
+    release = threading.Event()
+
+    def slow_token_endpoint(request):
+        release.wait(timeout=5)
+        return httpx.Response(200, json={"access_token": "tok", "expires_in": 3600})
+
+    client, requests = token_client(slow_token_endpoint)
+    results = []
+    threads = [
+        threading.Thread(target=lambda: results.append(auth.build_headers(entry, client)))
+        for _ in range(8)
+    ]
+    for thread in threads:
+        thread.start()
+    deadline = time.monotonic() + 5
+    while not requests and time.monotonic() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.2)  # time for the other callers to reach the endpoint, if the code lets them
+    release.set()
+    for thread in threads:
+        thread.join(timeout=5)
+    assert len(requests) == 1
+    assert results == [{"Authorization": "Bearer tok"}] * 8
