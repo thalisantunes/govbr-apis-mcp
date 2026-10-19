@@ -363,6 +363,10 @@ def test_caller_headers_cannot_duplicate_the_managed_credential(catalog, wire, m
         "Forwarded",
         "X-Forwarded-For",
         "x-forwarded-host",
+        "X-HTTP-Method-Override",
+        "X-Original-URL",
+        "x-rewrite-url",
+        "X-Real-IP",
     ],
 )
 def test_framing_and_proxy_headers_never_reach_the_wire(name, catalog, wire):
@@ -430,6 +434,72 @@ def test_oauth_api_gets_a_bearer_token(oauth_api, wire):
     assert out["status"] == 200
     assert [r.url.path for r in requests] == ["/token", "/v1/things"]
     assert requests[1].headers["authorization"] == "Bearer tok"
+
+
+def test_credential_whitespace_is_stripped_before_it_reaches_the_header(catalog, wire, monkeypatch):
+    """A key read from a file usually ends in a newline, which h11 refuses in a header."""
+    monkeypatch.setenv("DATAJUD_API_KEY", "SECRETKEY\n")
+    requests = wire()
+    out = server.call_api("datajud", "/api_publica_tjsp/_search", method="POST", body={"q": 1})
+    assert out["status"] == 200
+    assert requests[0].headers.get_list("authorization") == ["APIKey SECRETKEY"]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param("SEC\x01RET", id="control-character"),
+        pytest.param("SEC\nRET", id="interior-newline"),
+        pytest.param("SEC\rRET", id="interior-carriage-return"),
+        pytest.param("\u201cSECRET\u201d", id="smart-quotes"),
+    ],
+)
+def test_credential_with_invalid_characters_is_refused_without_echoing_it(
+    value, catalog, wire, monkeypatch
+):
+    monkeypatch.setenv("DATAJUD_API_KEY", value)
+    requests = wire()
+    out = server.call_api("datajud", "/api_publica_tjsp/_search", method="POST", body={"q": 1})
+    assert out["error"] == "credential in DATAJUD_API_KEY contains invalid characters"
+    assert "SEC" not in str(out)
+    assert requests == []
+
+
+def test_whitespace_only_credential_counts_as_unset(catalog, wire, monkeypatch):
+    monkeypatch.setenv("DATAJUD_API_KEY", " \n")
+    requests = wire()
+    [status] = server.credentials_status("datajud")
+    out = server.call_api("datajud", "/api_publica_tjsp/_search", method="POST", body={"q": 1})
+    assert status["ready"] is False
+    assert "requires env var DATAJUD_API_KEY" in out["error"]
+    assert requests == []
+
+
+def test_protocol_errors_do_not_echo_header_values(catalog, wire, monkeypatch):
+    """h11 quotes the header it rejects; when that is the credential it must not reach the result."""
+    monkeypatch.setenv("DATAJUD_API_KEY", "REAL-KEY")
+    wire()
+
+    def reject(request, **kwargs):
+        raise httpx.LocalProtocolError(
+            f"Illegal header value {request.headers['authorization'].encode()!r}"
+        )
+
+    monkeypatch.setattr(server._client, "send", reject)
+    out = server.call_api("datajud", "/api_publica_tjsp/_search", method="POST", body={"q": 1})
+    assert out["error"].startswith("LocalProtocolError")
+    assert "REAL-KEY" not in str(out)
+
+
+def test_other_transport_errors_keep_their_message(catalog, wire, monkeypatch):
+    wire()
+
+    def refuse(request, **kwargs):
+        raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(server._client, "send", refuse)
+    out = server.call_api("ibge-localidades", "/estados")
+    assert out["error"] == "ConnectError: connection refused"
 
 
 def test_token_failure_is_reported_as_a_tool_error(oauth_api, wire):

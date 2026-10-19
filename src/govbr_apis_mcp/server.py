@@ -28,10 +28,11 @@ DEFAULT_LIST_LIMIT = 40
 SENSITIVE_PARAM_HINTS = ("key", "token", "secret", "senha", "password", "chave")
 ALLOWED_METHODS = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
 # Headers the caller may not set: they would override the catalog-managed credential,
-# redirect the request to another virtual host, tamper with its framing, or defeat the
-# response size cut (Accept-Encoding stays "identity" so streaming really stops at
-# MAX_BODY_CHARS instead of after inflating a compressed chunk). X-Forwarded-* is
-# matched by prefix and the entry's own credential header is added per call.
+# redirect the request to another virtual host, tamper with its framing, make a proxy in
+# front of the API route or rewrite it differently, or defeat the response size cut
+# (Accept-Encoding stays "identity" so streaming really stops at MAX_BODY_CHARS instead
+# of after inflating a compressed chunk). X-Forwarded-* is matched by prefix and the
+# entry's own credential header is added per call.
 PROTECTED_HEADERS = frozenset(
     {
         "authorization",
@@ -47,15 +48,18 @@ PROTECTED_HEADERS = frozenset(
         "keep-alive",
         "forwarded",
         "accept-encoding",
+        "x-http-method-override",
+        "x-original-url",
+        "x-rewrite-url",
+        "x-real-ip",
     }
 )
 HEADER_NAME_RE = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")  # an RFC 9110 token
-HEADER_VALUE_RE = re.compile(r"[\t\x20-\x7e]*")  # printable ASCII: no CR, LF or NUL
 
 mcp = MCPServer("govbr-apis-mcp", version=__version__)
 _catalog: Catalog | None = None
-# follow_redirects stays False: these requests carry credentials and must not be
-# steered to another host by a 3xx. Spec fetches (openapi.py) opt in explicitly.
+# follow_redirects stays False: these requests carry credentials, so a 3xx must not steer them.
+# Spec fetches (openapi.py) follow up to 5 hops by hand, vetting https and the allowlist first.
 _client = httpx.Client(timeout=30, headers={"User-Agent": f"govbr-apis-mcp/{__version__}"})
 
 
@@ -226,6 +230,10 @@ def call_api(
 
     try:
         result = _send(method, url, params, body, request_headers)
+    except httpx.LocalProtocolError as exc:
+        # h11 quotes the header it rejects, and that header can be the credential
+        message = "the HTTP library rejected the request as malformed."
+        return {"error": f"{type(exc).__name__}: {message}", "url": url}
     except httpx.HTTPError as exc:
         return {"error": f"{type(exc).__name__}: {exc}", "url": url}
 
@@ -292,7 +300,7 @@ def _caller_headers(
         lowered = name.lower()
         if lowered in PROTECTED_HEADERS or lowered.startswith("x-forwarded-") or lowered == managed:
             ignored.append(name)
-        elif HEADER_NAME_RE.fullmatch(name) and HEADER_VALUE_RE.fullmatch(value):
+        elif HEADER_NAME_RE.fullmatch(name) and auth_module.HEADER_VALUE_RE.fullmatch(value):
             merged[name] = value
         else:
             raise ValueError(

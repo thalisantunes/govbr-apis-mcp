@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 import threading
 import time
 
@@ -21,9 +22,12 @@ import httpx
 
 from .catalog import ApiEntry
 
+# What a header value may hold on the wire: printable ASCII, so no CR, LF or NUL.
+HEADER_VALUE_RE = re.compile(r"[\t\x20-\x7e]*")
+
 
 class MissingCredentialsError(Exception):
-    pass
+    """Credentials are absent or unusable. Messages never carry the credential itself."""
 
 
 class TokenError(Exception):
@@ -34,17 +38,23 @@ _token_cache: dict[str, tuple[str, float]] = {}
 _token_lock = threading.Lock()  # the SDK runs sync tools in a thread pool
 
 
+def _secret(var: str | None) -> str:
+    """The value of a credential env var minus surrounding whitespace: one read from a
+    file usually ends in a newline, which would end up in the header."""
+    return os.environ.get(var or "", "").strip()
+
+
 def credentials_status(entry: ApiEntry) -> dict[str, object]:
     """Report which env vars the entry needs and whether they are set."""
     required: dict[str, bool] = {}
     if entry.auth == "api_key":
         var = entry.auth_config.get("env", "")
-        required[var] = bool(os.environ.get(var))
+        required[var] = bool(_secret(var))
     elif entry.auth == "oauth2_client_credentials":
         for key in ("client_id_env", "client_secret_env"):
             var = entry.auth_config.get(key, "")
             if var:
-                required[var] = bool(os.environ.get(var))
+                required[var] = bool(_secret(var))
     ready = entry.auth == "none" or (bool(required) and all(required.values()))
     return {"auth": entry.auth, "env_vars": required, "ready": ready}
 
@@ -61,13 +71,16 @@ def build_headers(entry: ApiEntry, client: httpx.Client) -> dict[str, str]:
 
 def _api_key_headers(entry: ApiEntry) -> dict[str, str]:
     var = entry.auth_config.get("env")
-    key = os.environ.get(var or "")
+    key = _secret(var)
     if not key:
         signup = entry.auth_config.get("signup_url")
         hint = f" Get one at {signup}." if signup else ""
         raise MissingCredentialsError(f"{entry.id} requires env var {var}.{hint}")
     prefix = entry.auth_config.get("value_prefix", "")
-    return {entry.auth_config["header"]: f"{prefix}{key}"}
+    value = f"{prefix}{key}"
+    if not HEADER_VALUE_RE.fullmatch(value):  # h11 would quote the value in its error
+        raise MissingCredentialsError(f"credential in {var} contains invalid characters")
+    return {entry.auth_config["header"]: value}
 
 
 def _oauth2_token(entry: ApiEntry, client: httpx.Client) -> str:
@@ -84,8 +97,8 @@ def _oauth2_token(entry: ApiEntry, client: httpx.Client) -> str:
             "Fill auth_config.token_url/client_id_env/client_secret_env — see the "
             "catalog override mechanism in the README."
         )
-    client_id = os.environ.get(id_var)
-    client_secret = os.environ.get(secret_var)
+    client_id = _secret(id_var)
+    client_secret = _secret(secret_var)
     if not client_id or not client_secret:
         raise MissingCredentialsError(
             f"{entry.id} requires env vars {id_var} and {secret_var} (status: {entry.status})."
@@ -111,6 +124,10 @@ def _oauth2_token(entry: ApiEntry, client: httpx.Client) -> str:
         raise TokenError(f"{entry.id}: token request failed ({type(exc).__name__})") from None
     except (ValueError, KeyError, TypeError):
         raise TokenError(f"{entry.id}: token endpoint returned no access_token") from None
+    if not HEADER_VALUE_RE.fullmatch(token):
+        raise TokenError(
+            f"{entry.id}: token endpoint returned an access_token with invalid characters"
+        )
     if ttl > 60:  # short-lived tokens are not cached — serving an expired one is worse
         with _token_lock:
             _token_cache[entry.id] = (token, time.monotonic() + ttl - 30)

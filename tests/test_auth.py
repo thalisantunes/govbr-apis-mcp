@@ -1,6 +1,7 @@
 """Tests for the OAuth2 client-credentials flow and the ways its token endpoint fails."""
 
 import base64
+import types
 
 import httpx
 import pytest
@@ -113,3 +114,48 @@ def test_failed_token_request_is_not_cached(entry):
         auth.build_headers(entry, client)
     assert auth.build_headers(entry, client) == {"Authorization": "Bearer tok"}
     assert len(requests) == 2
+
+
+def test_oauth_env_vars_are_stripped(entry, monkeypatch):
+    monkeypatch.setenv("SERPRO_CNPJ_CLIENT_ID", "the-id\n")
+    monkeypatch.setenv("SERPRO_CNPJ_CLIENT_SECRET", " the-secret \r\n")
+    client, requests = token_client(
+        lambda request: httpx.Response(200, json={"access_token": "tok", "expires_in": 3600})
+    )
+    auth.build_headers(entry, client)
+    expected = "Basic " + base64.b64encode(b"the-id:the-secret").decode()
+    assert requests[0].headers["authorization"] == expected
+
+
+def test_whitespace_only_env_var_counts_as_unset(entry, monkeypatch):
+    monkeypatch.setenv("SERPRO_CNPJ_CLIENT_SECRET", " \n")
+    assert auth.credentials_status(entry)["ready"] is False
+    client, requests = token_client(lambda request: httpx.Response(200))
+    with pytest.raises(auth.MissingCredentialsError, match="SERPRO_CNPJ_CLIENT_SECRET"):
+        auth.build_headers(entry, client)
+    assert requests == []
+
+
+def test_nul_in_a_credential_is_refused(monkeypatch):
+    """A real environment cannot hold NUL (putenv refuses it), so hand the module a dict."""
+    entry = Catalog.load().get("datajud")
+    environ = {"DATAJUD_API_KEY": "SEC\x00RET"}
+    monkeypatch.setattr(auth, "os", types.SimpleNamespace(environ=environ))
+    with pytest.raises(auth.MissingCredentialsError) as excinfo:
+        auth.build_headers(entry, client=None)
+    assert str(excinfo.value) == "credential in DATAJUD_API_KEY contains invalid characters"
+
+
+def test_token_that_cannot_travel_in_a_header_is_refused(entry):
+    client, requests = token_client(
+        lambda request: httpx.Response(
+            200, json={"access_token": "LEAKY\nTOKEN", "expires_in": 3600}
+        )
+    )
+    for _ in range(2):
+        with pytest.raises(auth.TokenError) as excinfo:
+            auth.build_headers(entry, client)
+        assert str(excinfo.value) == (
+            "serpro-consulta-cnpj: token endpoint returned an access_token with invalid characters"
+        )
+    assert len(requests) == 2  # the unusable token was not cached
