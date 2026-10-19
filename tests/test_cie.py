@@ -147,6 +147,7 @@ def test_fesn_unknown_card():
 
 def test_check_any_falls_back_to_fesn(monkeypatch):
     """A legitimate card unknown to DNE must not be denied — the real AB12CD34 case."""
+
     def fake_call(api_id, path, **kwargs):
         if api_id == "meiaentrada-cie-validador":
             return {"body": {"status": False, "codigoRetorno": "2"}}
@@ -157,8 +158,13 @@ def test_check_any_falls_back_to_fesn(monkeypatch):
 
 
 def test_check_any_reason_when_all_bases_fail():
-    d = check_any("X", "20000115", "e", "00000000000191",
-                  caller=lambda *a, **k: {"body": {"status": False, "codigoRetorno": "2"}})
+    d = check_any(
+        "X",
+        "20000115",
+        "e",
+        "00000000000191",
+        caller=lambda *a, **k: {"body": {"status": False, "codigoRetorno": "2"}},
+    )
     assert not d.eligible
     assert "pendência documental" in d.reason and "não como recusa" in d.reason
 

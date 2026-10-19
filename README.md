@@ -1,5 +1,7 @@
 # govbr-apis-mcp
 
+[![CI](https://github.com/thalisantunes/govbr-apis-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/thalisantunes/govbr-apis-mcp/actions/workflows/ci.yml)
+
 <!-- mcp-name: io.github.thalisantunes/govbr-apis-mcp -->
 
 MCP server that turns Brazilian government APIs into Claude-callable tools through a
@@ -11,10 +13,10 @@ API's OpenAPI spec on demand.
 
 | Tier | File | Access model | Callable today? |
 |------|------|--------------|-----------------|
-| `public` | `catalog/public.yaml` | Free — no auth or free API key (IBGE, Banco Central, Câmara, Senado, Portal da Transparência, DataJud, Ipeadata, dados.gov.br…) | Yes |
-| `serpro` | `catalog/serpro.yaml` | Serpro commercial (loja.serpro.gov.br) — OAuth2 client credentials per contracted API, paid per call | With a Serpro contract |
-| `meia-entrada` | `catalog/meia_entrada.yaml` | Eligibility sources for half-price tickets (student CIE, ID Jovem, PcD, e-MEC) — see [docs/meia-entrada.md](docs/meia-entrada.md) | CIE yes; the rest is manual |
-| `conecta` | `catalog/conecta.yaml` | [Conecta gov.br](https://www.gov.br/conecta/catalogo/) — **restricted to public-sector entities**; 95 APIs indexed as stubs for discovery | Not yet (adhesion pending) |
+| `public` | `src/govbr_apis_mcp/catalog_data/public.yaml` | Free — no auth or free API key (IBGE, Banco Central, Câmara, Senado, Portal da Transparência, DataJud, Ipeadata, dados.gov.br…) | Yes |
+| `serpro` | `src/govbr_apis_mcp/catalog_data/serpro.yaml` | Serpro commercial (loja.serpro.gov.br) — OAuth2 client credentials per contracted API, paid per call | With a Serpro contract |
+| `meia-entrada` | `src/govbr_apis_mcp/catalog_data/meia_entrada.yaml` | Eligibility sources for half-price tickets (student CIE, ID Jovem, PcD, e-MEC) — see [docs/meia-entrada.md](docs/meia-entrada.md) | CIE yes; the rest is manual |
+| `conecta` | `src/govbr_apis_mcp/catalog_data/conecta.yaml` | [Conecta gov.br](https://www.gov.br/conecta/catalogo/) — **restricted to public-sector entities**; 95 APIs indexed as stubs for discovery | Not yet (adhesion pending) |
 
 The Conecta tier exists so the catalog reflects the whole landscape now, and becomes
 callable later by filling in `base_url` + credentials — the OAuth2 client-credentials
@@ -75,10 +77,10 @@ in-memory token cache; used by Serpro today, by Conecta after adhesion).
 
 ## Extending the catalog
 
-Add an entry to a YAML file in `catalog/`. Minimum fields: `id`, `name`, `provider`,
-`category`, `status`, `auth`. Add `openapi_url` when the API publishes a spec —
-`describe_api` then works with zero code. Regenerate the Conecta tier with
-`python scripts/scrape_conecta.py`.
+Add an entry to a YAML file in `src/govbr_apis_mcp/catalog_data/`. Minimum fields:
+`id`, `name`, `provider`, `category`, `status`, `auth`. Add `openapi_url` when the API
+publishes a spec — `describe_api` then works with zero code. Regenerate the Conecta
+tier with `python scripts/scrape_conecta.py`.
 
 Entries are validated on load: ids must be filename-safe, URLs must be `https` on an
 allowlisted host (`*.gov.br`, `*.leg.br`, `*.jus.br` plus a few named hosts). This is a
@@ -89,6 +91,19 @@ To override entries without forking (e.g. filling in Conecta base URLs after adh
 point `GOVBR_EXTRA_CATALOG_DIR` at a directory whose same-id entries win.
 `GOVBR_CATALOG_DIR` replaces the base catalog entirely and should be treated as trusted
 input.
+
+## Development
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -e '.[dev]'
+.venv/bin/ruff check .
+.venv/bin/ruff format --check .
+.venv/bin/pytest
+```
+
+CI runs ruff on Python 3.12 and the test suite on 3.11–3.14, then builds the wheel and
+loads the catalog from a clean install.
 
 ## Security notes
 

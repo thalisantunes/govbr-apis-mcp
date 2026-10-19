@@ -81,8 +81,7 @@ def _oauth2_token(entry: ApiEntry, client: httpx.Client) -> str:
     client_secret = os.environ.get(secret_var)
     if not client_id or not client_secret:
         raise MissingCredentialsError(
-            f"{entry.id} requires env vars {id_var} and {secret_var} "
-            f"(status: {entry.status})."
+            f"{entry.id} requires env vars {id_var} and {secret_var} (status: {entry.status})."
         )
 
     basic = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()

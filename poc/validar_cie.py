@@ -70,7 +70,9 @@ def render(decision, titulo: str) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--codigo-uso", help="código de uso da CIE (o que vem no QR code)")
     parser.add_argument("--nascimento", help="data de nascimento do portador (YYYY-MM-DD)")
     parser.add_argument("--evento", default="POC meia-entrada", help="nome do evento")
@@ -98,8 +100,10 @@ def main() -> int:
 
     missing = [f for f in ("codigo_uso", "nascimento", "cnpj") if not getattr(args, f)]
     if missing:
-        parser.error(f"faltam argumentos: {', '.join('--' + m.replace('_', '-') for m in missing)}"
-                     " — ou use --demo")
+        parser.error(
+            f"faltam argumentos: {', '.join('--' + m.replace('_', '-') for m in missing)}"
+            " — ou use --demo"
+        )
 
     if args.provedor == "dne" and not os.environ.get("MEIAENTRADA_CODIGO_ACESSO"):
         print(

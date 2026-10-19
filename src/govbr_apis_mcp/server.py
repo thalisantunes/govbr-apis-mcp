@@ -77,8 +77,11 @@ def list_apis(
     try:
         entries = get_catalog().list(category=category, status=status)
     except ValueError as exc:
-        return {"error": str(exc), "valid_categories": list(CATEGORIES),
-                "valid_statuses": list(STATUSES)}
+        return {
+            "error": str(exc),
+            "valid_categories": list(CATEGORIES),
+            "valid_statuses": list(STATUSES),
+        }
     shown = entries[: max(1, limit)]
     return {
         "total": len(entries),
@@ -162,8 +165,9 @@ def call_api(
     request_headers = {"Accept": "application/json"}
     rejected = sorted(h for h in (headers or {}) if h.lower() in PROTECTED_HEADERS)
     if headers:
-        request_headers.update({k: v for k, v in headers.items()
-                                if k.lower() not in PROTECTED_HEADERS})
+        request_headers.update(
+            {k: v for k, v in headers.items() if k.lower() not in PROTECTED_HEADERS}
+        )
     try:
         request_headers.update(auth_module.build_headers(entry, _client))
     except auth_module.MissingCredentialsError as exc:
@@ -191,14 +195,14 @@ def credentials_status(api_id: str | None = None) -> list[dict[str, Any]]:
     catalog entry that requires auth, so you can see what is ready to call."""
     catalog = get_catalog()
     try:
-        entries = [catalog.get(api_id)] if api_id else [
-            e for e in catalog.list() if e.auth != "none" and e.category != "conecta"
-        ]
+        entries = (
+            [catalog.get(api_id)]
+            if api_id
+            else [e for e in catalog.list() if e.auth != "none" and e.category != "conecta"]
+        )
     except KeyError as exc:
         return [{"error": str(exc)}]
-    return [
-        {"id": e.id, "status": e.status, **auth_module.credentials_status(e)} for e in entries
-    ]
+    return [{"id": e.id, "status": e.status, **auth_module.credentials_status(e)} for e in entries]
 
 
 def _build_target(

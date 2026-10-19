@@ -5,17 +5,34 @@ on:
     types: [published]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - run: python -m pip install --upgrade build twine
+      - run: python -m pip install -e '.[dev]'
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: pytest -q
       - run: python -m build
       - run: python -m twine check dist/*
+      # Lint, tests and twine check all pass for a wheel without the catalog, so load it
+      # from the wheel itself, in a clean venv and outside the checkout.
+      - name: Smoke-test the wheel
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -m venv "$RUNNER_TEMP/smoke"
+          "$RUNNER_TEMP/smoke/bin/pip" install "$GITHUB_WORKSPACE"/dist/*.whl
+          "$RUNNER_TEMP/smoke/bin/python" -I -c 'from govbr_apis_mcp.catalog import Catalog, DEFAULT_CATALOG_DIR; assert "site-packages" in str(DEFAULT_CATALOG_DIR), "catalog dir is not inside site-packages"; assert len(Catalog.load(DEFAULT_CATALOG_DIR).list()) > 100, "catalog has too few entries"'
       - uses: actions/upload-artifact@v4
         with:
           name: dist
@@ -23,6 +40,7 @@ jobs:
 
   publish:
     needs: build
+    if: github.event_name == 'release' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

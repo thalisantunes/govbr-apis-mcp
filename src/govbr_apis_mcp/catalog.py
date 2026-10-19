@@ -1,6 +1,6 @@
 """Catalog loading, validation and search.
 
-The catalog is a set of YAML files in the repo's catalog/ directory. Each file has
+The catalog is a set of YAML files in the package's catalog_data/ directory. Each file has
 an `apis:` list; ids must be unique across files (a duplicate is an error, not a
 merge). GOVBR_EXTRA_CATALOG_DIR adds a second directory whose entries override
 same-id entries from the base catalog — that is the supported way to fill in
@@ -23,7 +23,7 @@ from urllib.parse import urlsplit
 
 import yaml
 
-DEFAULT_CATALOG_DIR = Path(__file__).resolve().parents[2] / "catalog"
+DEFAULT_CATALOG_DIR = Path(__file__).resolve().parent / "catalog_data"
 
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 
@@ -121,7 +121,9 @@ class ApiEntry:
 
         token_url = self.auth_config.get("token_url")
         if token_url and (not token_url.startswith("https://") or not host_allowed(token_url)):
-            raise ValueError(f"{where}: auth_config.token_url not https/allowlisted ({token_url!r})")
+            raise ValueError(
+                f"{where}: auth_config.token_url not https/allowlisted ({token_url!r})"
+            )
         if self.auth == "api_key" and not self.auth_config.get("header"):
             raise ValueError(f"{where}: auth=api_key requires auth_config.header")
         if self.auth == "oauth2_client_credentials" and self.callable and not token_url:
