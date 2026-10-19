@@ -2,8 +2,9 @@
 
 Specs are fetched on demand from the catalog entry's openapi_url and cached on
 disk (~/.cache/govbr-apis-mcp, 24h TTL) so describe_api stays cheap. Cache file
-names are hashes of the api id — never the id itself, which would let a catalog
-entry read or overwrite arbitrary .json files on disk.
+names are hashes of the api id and spec URL — never the id itself, which would let
+a catalog entry read or overwrite arbitrary .json files on disk — so editing an
+entry's openapi_url takes effect at once instead of after the TTL.
 
 Redirects are followed by hand: every hop, the first URL included, must be https on
 an allowlisted host before it is requested, and bodies are capped at MAX_SPEC_BYTES.
@@ -23,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import yaml
 
 from .catalog import host_allowed
 
@@ -39,21 +41,23 @@ def _cache_dir() -> Path:
     return path
 
 
-def cache_path(api_id: str) -> Path:
-    return _cache_dir() / f"{hashlib.sha256(api_id.encode()).hexdigest()}.json"
+def cache_path(api_id: str, openapi_url: str) -> Path:
+    key = f"{api_id}\n{openapi_url}"
+    return _cache_dir() / f"{hashlib.sha256(key.encode()).hexdigest()}.json"
 
 
 def fetch_spec(api_id: str, openapi_url: str, client: httpx.Client) -> dict[str, Any]:
-    cache_file = cache_path(api_id)
+    cache_file = cache_path(api_id, openapi_url)
     if cache_file.exists() and time.time() - cache_file.stat().st_mtime < CACHE_TTL_SECONDS:
         try:
             return json.loads(cache_file.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             cache_file.unlink(missing_ok=True)  # corrupted cache repairs itself
 
-    spec = json.loads(_download(api_id, openapi_url, client))
-    _write_atomic(cache_file, json.dumps(spec))
-    return spec
+    spec = _parse_spec(_download(api_id, openapi_url, client))
+    text = json.dumps(spec, default=str)  # YAML can carry dates, which JSON cannot
+    _write_atomic(cache_file, text)
+    return json.loads(text)  # what a later cache hit returns: dates and int keys as strings
 
 
 def _download(api_id: str, url: str, client: httpx.Client) -> bytes:
@@ -79,6 +83,20 @@ def _download(api_id: str, url: str, client: httpx.Client) -> bytes:
                 return bytes(body)
             current = resp.next_request.url
     raise ValueError(f"Spec fetch for {api_id} followed more than {MAX_REDIRECTS} redirects")
+
+
+def _parse_spec(body: bytes) -> dict[str, Any]:
+    """Specs come as JSON or YAML, and servers rarely label them right: sniff the body."""
+    try:
+        spec = json.loads(body)
+    except ValueError:  # JSONDecodeError and UnicodeDecodeError
+        try:
+            spec = yaml.safe_load(body)
+        except yaml.YAMLError:
+            spec = None
+    if not isinstance(spec, dict) or not ({"openapi", "swagger"} & spec.keys()):
+        raise ValueError("not an OpenAPI document")
+    return spec
 
 
 def _write_atomic(target: Path, content: str) -> None:

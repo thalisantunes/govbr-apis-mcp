@@ -1,6 +1,7 @@
 """Tests for OpenAPI spec fetching and summarizing. No network: httpx.MockTransport only."""
 
 import json
+import re
 
 import httpx
 import pytest
@@ -158,3 +159,86 @@ def test_spec_one_byte_over_the_cap_is_rejected():
     )
     with pytest.raises(ValueError, match="spec too large"):
         fetch_spec("demo", SPEC_URL, client)
+
+
+# --- YAML specs and document sniffing -----------------------------------------------------
+
+YAML_SPEC = """\
+openapi: 3.0.0
+info:
+  title: Demo YAML
+  version: 2024-01-01
+paths:
+  /things:
+    get:
+      responses:
+        200:
+          description: ok
+"""
+
+
+@pytest.mark.parametrize("content_type", ["application/yaml", "text/plain", "application/json"])
+def test_yaml_spec_is_parsed_whatever_the_server_calls_it(content_type):
+    client, requested = make_client(
+        lambda request: httpx.Response(
+            200, content=YAML_SPEC.encode(), headers={"content-type": content_type}
+        )
+    )
+    spec = fetch_spec("demo", SPEC_URL, client)
+    assert spec["info"] == {"title": "Demo YAML", "version": "2024-01-01"}
+    assert list(spec["paths"]["/things"]["get"]["responses"]) == ["200"]
+    # The cache holds JSON, so a cache hit returns exactly what the first call returned.
+    assert fetch_spec("demo", SPEC_URL, client) == spec
+    assert len(requested) == 1
+
+
+def test_swagger_2_document_is_accepted():
+    swagger = {"swagger": "2.0", "info": {"title": "Old", "version": "1"}, "paths": {}}
+    client, _ = make_client(lambda request: ok(swagger))
+    assert fetch_spec("demo", SPEC_URL, client) == swagger
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"[]",
+        b'{"hello": "world"}',
+        b'{"paths": {}}',
+        b"<html><body>Login</body></html>",
+        b"plain text",
+        b"a: b: c",
+        b"",
+        b"\xff\xfe\x00",
+    ],
+)
+def test_non_openapi_documents_are_rejected_and_not_cached(body, cache_home):
+    client, _ = make_client(lambda request: httpx.Response(200, content=body))
+    with pytest.raises(ValueError, match="not an OpenAPI document"):
+        fetch_spec("demo", SPEC_URL, client)
+    assert not list(cache_home.glob("*"))
+
+
+# --- cache key ----------------------------------------------------------------------------
+
+
+def test_cache_is_keyed_by_api_id_and_url(cache_home):
+    url_a, url_b = SPEC_URL, "https://api.demo.gov.br/v2/openapi.json"
+    specs = {
+        url_a: {**SPEC, "info": {"title": "A", "version": "1"}},
+        url_b: {**SPEC, "info": {"title": "B", "version": "1"}},
+    }
+    client, requested = make_client(lambda request: ok(specs[str(request.url)]))
+
+    assert fetch_spec("demo", url_a, client)["info"]["title"] == "A"
+    # Same id, new openapi_url: a catalog edit must not be shadowed by the old cache entry.
+    assert fetch_spec("demo", url_b, client)["info"]["title"] == "B"
+    assert fetch_spec("demo", url_a, client)["info"]["title"] == "A"
+    assert requested == [url_a, url_b]  # the third call was a cache hit
+    assert openapi.cache_path("demo", url_a) != openapi.cache_path("demo", url_b)
+    assert len(list(cache_home.glob("*.json"))) == 2
+
+
+def test_cache_file_name_is_a_hash_inside_the_cache_dir(cache_home):
+    path = openapi.cache_path("../../etc/passwd", SPEC_URL)
+    assert path.parent == cache_home
+    assert re.fullmatch(r"[0-9a-f]{64}\.json", path.name)
