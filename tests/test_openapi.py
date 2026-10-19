@@ -1,7 +1,11 @@
 """Tests for OpenAPI spec fetching and summarizing. No network: httpx.MockTransport only."""
 
+import gzip
 import json
+import os
 import re
+import time
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -15,9 +19,26 @@ SPEC = {"openapi": "3.0.0", "info": {"title": "Demo", "version": "1"}, "paths": 
 
 @pytest.fixture(autouse=True)
 def cache_home(tmp_path, monkeypatch):
-    """The spec cache lives under tmp_path, never in the real ~/.cache."""
+    """The spec cache lives under tmp_path, never in the real ~/.cache, and the allowlist is
+    the built-in one whatever the developer has exported."""
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    monkeypatch.delenv("GOVBR_EXTRA_ALLOWED_HOSTS", raising=False)
     return tmp_path / "govbr-apis-mcp"
+
+
+def unread(response: httpx.Response) -> httpx.Response:
+    """httpx reads a response built from bytes on the spot, but a real transport hands over
+    one whose body is still on the wire (iter_raw refuses a body that was already read), so
+    rebuild such a response the way a transport would."""
+    if not response.is_stream_consumed:
+        return response
+    stream = httpx.ByteStream(response.content)
+    return httpx.Response(response.status_code, headers=response.headers, stream=stream)
+
+
+def mock_client(handler, **options) -> httpx.Client:
+    transport = httpx.MockTransport(lambda request: unread(handler(request)))
+    return httpx.Client(transport=transport, **options)
 
 
 def make_client(responder):
@@ -28,7 +49,7 @@ def make_client(responder):
         requested.append(str(request.url))
         return responder(request)
 
-    return httpx.Client(transport=httpx.MockTransport(handler)), requested
+    return mock_client(handler), requested
 
 
 def redirect(location: str, status: int = 302) -> httpx.Response:
@@ -115,10 +136,12 @@ def test_redirect_limit(redirects, allowed):
         assert len(requested) == 6  # the sixth redirect is refused, not followed
 
 
-def test_3xx_without_location_is_an_http_error():
-    client, _ = make_client(lambda request: httpx.Response(304))
+@pytest.mark.parametrize("status", [302, 307, 308])
+def test_a_redirect_without_location_is_an_http_error(status):
+    client, requested = make_client(lambda request: httpx.Response(status))
     with pytest.raises(httpx.HTTPStatusError):
         fetch_spec("demo", SPEC_URL, client)
+    assert requested == [SPEC_URL]
 
 
 def test_a_client_that_follows_redirects_by_default_is_still_checked_hop_by_hop():
@@ -130,7 +153,7 @@ def test_a_client_that_follows_redirects_by_default_is_still_checked_hop_by_hop(
             return redirect("https://evil.example.com/openapi.json")
         return ok()
 
-    client = httpx.Client(follow_redirects=True, transport=httpx.MockTransport(handler))
+    client = mock_client(handler, follow_redirects=True)
     with pytest.raises(ValueError, match="evil.example.com"):
         fetch_spec("demo", SPEC_URL, client)
     assert requested == [SPEC_URL]
@@ -143,14 +166,41 @@ def test_a_spec_url_httpx_cannot_parse_is_a_value_error():
     assert requested == []
 
 
-def test_a_location_httpx_cannot_parse_is_a_value_error():
-    client, requested = make_client(lambda request: redirect("https://api.demo.gov.br:evil/x"))
-    with pytest.raises(ValueError, match="location header"):
+@pytest.mark.parametrize(
+    "location",
+    [
+        "https://api.demo.gov.br:evil/x",  # httpx: Invalid URL in location header
+        "https:foo",  # a scheme but no host: httpx.InvalidURL
+        "https:sub.gov.br/x",
+        "javascript:alert(1)",
+        "mailto:someone@demo.gov.br",
+        "https://xn--/",  # a broken A-label: idna.IDNAError, a UnicodeError
+    ],
+)
+def test_a_location_httpx_cannot_parse_is_a_value_error(location):
+    client, requested = make_client(lambda request: redirect(location))
+    with pytest.raises(
+        ValueError, match=rf"Spec fetch for demo: invalid redirect from {re.escape(SPEC_URL)}"
+    ):
         fetch_spec("demo", SPEC_URL, client)
     assert requested == [SPEC_URL]
 
 
+def test_a_genuine_protocol_error_is_not_passed_off_as_a_bad_redirect():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.RemoteProtocolError(
+            "peer closed connection without sending complete message body", request=request
+        )
+
+    client = mock_client(handler)
+    with pytest.raises(httpx.RemoteProtocolError, match="peer closed connection"):
+        fetch_spec("demo", SPEC_URL, client)
+
+
 # --- size cap -----------------------------------------------------------------------------
+
+
+FIVE_MIB = 5 * 1024 * 1024  # written out on purpose: the tests must notice if the cap moves
 
 
 def padded(total: int) -> bytes:
@@ -161,33 +211,120 @@ def padded(total: int) -> bytes:
 
 def test_oversized_body_is_cut_while_streaming():
     chunk = b" " * (1024 * 1024)
-    cap_chunks = openapi.MAX_SPEC_BYTES // len(chunk)
     served = []
 
     def body():
-        for i in range(cap_chunks + 20):  # keeps offering data well past the cap
+        for i in range(25):  # keeps offering data far past 5 MiB
             served.append(i)
             yield chunk
 
     client, _ = make_client(lambda request: httpx.Response(200, content=body()))
     with pytest.raises(ValueError, match="spec too large"):
         fetch_spec("demo", SPEC_URL, client)
-    assert len(served) <= cap_chunks + 1  # stopped right after crossing the cap
+    assert len(served) == 6  # the sixth MiB crosses the cap and is the last one read
 
 
 def test_spec_exactly_at_the_cap_is_accepted():
-    client, _ = make_client(
-        lambda request: httpx.Response(200, content=padded(openapi.MAX_SPEC_BYTES))
-    )
+    client, _ = make_client(lambda request: httpx.Response(200, content=padded(FIVE_MIB)))
     assert fetch_spec("demo", SPEC_URL, client) == SPEC
 
 
 def test_spec_one_byte_over_the_cap_is_rejected():
-    client, _ = make_client(
-        lambda request: httpx.Response(200, content=padded(openapi.MAX_SPEC_BYTES + 1))
-    )
+    client, _ = make_client(lambda request: httpx.Response(200, content=padded(FIVE_MIB + 1)))
     with pytest.raises(ValueError, match="spec too large"):
         fetch_spec("demo", SPEC_URL, client)
+
+
+# --- compression and time: the cap is on what travels, the deadline on the whole download --
+
+
+def gzipped(size: int, times: int = 1) -> bytes:
+    data = b" " * size
+    for _ in range(times):
+        data = gzip.compress(data, compresslevel=1)
+    return data
+
+
+@pytest.mark.parametrize("encoding", ["gzip", "gzip, gzip", "deflate", "br", "GZIP"])
+def test_compressed_responses_are_refused_before_a_byte_is_read(encoding):
+    """A few hundred bytes of gzip inflate to gigabytes in a single step, so a cap checked
+    afterwards is too late: the response is refused on its header alone."""
+    served = []
+
+    def body():
+        served.append(1)
+        yield gzipped(6 * 1024 * 1024, times=2 if "," in encoding else 1)
+
+    client, _ = make_client(
+        lambda request: httpx.Response(200, content=body(), headers={"content-encoding": encoding})
+    )
+    message = rf"compressed spec responses are not supported \(Content-Encoding: {encoding}\)"
+    with pytest.raises(ValueError, match=message):
+        fetch_spec("demo", SPEC_URL, client)
+    assert served == []  # nothing was read, so nothing was inflated
+
+
+@pytest.mark.parametrize("encoding", ["identity", "Identity", " identity "])
+def test_content_encoding_identity_is_accepted(encoding):
+    client, _ = make_client(
+        lambda request: httpx.Response(200, json=SPEC, headers={"content-encoding": encoding})
+    )
+    assert fetch_spec("demo", SPEC_URL, client) == SPEC
+
+
+def test_every_request_asks_for_an_uncompressed_body():
+    asked: list[str | None] = []
+
+    def responder(request):
+        asked.append(request.headers.get("accept-encoding"))
+        return redirect("/v2/openapi.json") if request.url.path == "/openapi.json" else ok()
+
+    client, _ = make_client(responder)
+    fetch_spec("demo", SPEC_URL, client)
+    assert asked == ["identity", "identity"]  # the first hop and the redirect target
+
+
+class Clock:
+    """A time.monotonic that only moves when a test moves it."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def monotonic(self):
+        return self.now
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    fake = Clock()
+    monkeypatch.setattr(openapi, "time", SimpleNamespace(monotonic=fake.monotonic, time=time.time))
+    return fake
+
+
+def test_a_slow_drip_is_cut_off_by_the_total_deadline(clock):
+    served = []
+
+    def drip():
+        for i in range(10):
+            clock.now += 25  # each chunk shows up 25 s after the previous one
+            served.append(i)
+            yield b" "
+
+    client, _ = make_client(lambda request: httpx.Response(200, content=drip()))
+    with pytest.raises(ValueError, match="spec download exceeded 60 s"):
+        fetch_spec("demo", SPEC_URL, client)
+    assert len(served) == 3  # 25 s, 50 s, and 75 s is past the 60 s deadline
+
+
+def test_redirect_hops_count_towards_the_total_deadline(clock):
+    def responder(request):
+        clock.now += 40  # every hop takes 40 s
+        return redirect(f"/t{clock.now:.0f}")
+
+    client, requested = make_client(responder)
+    with pytest.raises(ValueError, match="spec download exceeded 60 s"):
+        fetch_spec("demo", SPEC_URL, client)
+    assert len(requested) == 2  # 40 s in, a second hop starts; 80 s in, a third is refused
 
 
 # --- YAML specs and document sniffing -----------------------------------------------------
@@ -278,6 +415,31 @@ def test_a_document_that_is_neither_json_nor_yaml_says_where_json_broke(body, wh
         fetch_spec("demo", SPEC_URL, client)
 
 
+def test_a_yaml_key_that_is_a_date_is_a_value_error(cache_home):
+    body = b"openapi: 3.0.0\nx-changelog:\n  2024-01-01: first release\n"
+    client, _ = make_client(lambda request: httpx.Response(200, content=body))
+    with pytest.raises(ValueError, match="unsupported key types in spec"):
+        fetch_spec("demo", SPEC_URL, client)
+    assert not list(cache_home.glob("*"))
+
+
+@pytest.mark.parametrize("body", [b"[" * 300_000, b"x: " + b"[" * 100_000], ids=["json", "yaml"])
+def test_absurdly_nested_documents_are_value_errors(body, cache_home):
+    client, _ = make_client(lambda request: httpx.Response(200, content=body))
+    with pytest.raises(ValueError, match="spec too deeply nested"):
+        fetch_spec("demo", SPEC_URL, client)
+    assert not list(cache_home.glob("*"))
+
+
+def test_serializing_an_absurdly_nested_spec_is_a_value_error():
+    deep = current = {"openapi": "3.0.0"}
+    for _ in range(50_000):
+        current["next"] = {}
+        current = current["next"]
+    with pytest.raises(ValueError, match="spec too deeply nested"):
+        openapi._round_trip(deep)
+
+
 # --- cache key ----------------------------------------------------------------------------
 
 
@@ -295,6 +457,7 @@ def test_cache_is_keyed_by_api_id_and_url(cache_home):
     assert fetch_spec("demo", url_a, client)["info"]["title"] == "A"
     assert requested == [url_a, url_b]  # the third call was a cache hit
     assert openapi.cache_path("demo", url_a) != openapi.cache_path("demo", url_b)
+    assert openapi.cache_path("one", url_a) != openapi.cache_path("two", url_a)
     assert len(list(cache_home.glob("*.json"))) == 2
 
 
@@ -302,6 +465,26 @@ def test_cache_file_name_is_a_hash_inside_the_cache_dir(cache_home):
     path = openapi.cache_path("../../etc/passwd", SPEC_URL)
     assert path.parent == cache_home
     assert re.fullmatch(r"[0-9a-f]{64}\.json", path.name)
+
+
+@pytest.mark.parametrize(("age_hours", "fetched_again"), [(23, False), (25, True)])
+def test_cache_entries_live_24_hours(age_hours, fetched_again):
+    client, requested = make_client(lambda request: ok())
+    fetch_spec("demo", SPEC_URL, client)
+    path = openapi.cache_path("demo", SPEC_URL)
+    then = time.time() - age_hours * 3600
+    os.utime(path, (then, then))
+    fetch_spec("demo", SPEC_URL, client)
+    assert len(requested) == (2 if fetched_again else 1)
+
+
+def test_a_corrupted_cache_file_is_repaired_by_fetching_again():
+    client, requested = make_client(lambda request: ok())
+    path = openapi.cache_path("demo", SPEC_URL)
+    path.write_text("{not json", encoding="utf-8")
+    assert fetch_spec("demo", SPEC_URL, client) == SPEC
+    assert len(requested) == 1
+    assert json.loads(path.read_text(encoding="utf-8")) == SPEC
 
 
 # --- summarize_spec / describe_operation --------------------------------------------------
@@ -367,7 +550,10 @@ def test_parameter_refs_are_resolved_before_reading_name_and_location():
     assert by_name["id"]["schema"] == {"type": "string"}
     assert by_name["limit"]["in"] == "query"
     assert by_name["limit"]["schema"] == {"type": "integer", "maximum": 100}
-    assert len(params) == 3  # the pointer into another file is kept, just not resolvable
+    assert len(params) == 3
+    unresolved = [p for p in params if p["name"] is None]
+    # the pointer into another file cannot be followed, but the model is told which one it was
+    assert [p["$ref"] for p in unresolved] == ["other.yaml#/parameters/Elsewhere"]
 
 
 def test_operation_parameter_replaces_the_inherited_one_with_the_same_name_and_location():
@@ -542,7 +728,12 @@ def test_unresolvable_parameter_refs_are_kept_apart():
             }
         }
     }
-    assert len(operation(spec, "/x", "get")["parameters"]) == 3
+    params = operation(spec, "/x", "get")["parameters"]
+    assert sorted(p.get("$ref") or p["name"] for p in params) == [
+        "other.yaml#/parameters/A",
+        "other.yaml#/parameters/B",
+        "q",
+    ]
 
 
 def test_parameter_refs_to_something_other_than_an_object_are_left_alone():
@@ -557,3 +748,61 @@ def test_parameter_refs_to_something_other_than_an_object_are_left_alone():
         "components": {"nothing": None, "list": [1, 2]},
     }
     assert len(operation(spec, "/x", "get")["parameters"]) == 2
+
+
+def test_json_pointers_are_unescaped():
+    spec = {
+        "paths": {
+            "/x": {
+                "post": {
+                    "parameters": [{"$ref": "#/components/parameters/a~1b"}],
+                    "requestBody": {
+                        "content": {
+                            "application/json": {"schema": {"$ref": "#/components/schemas/c~0d"}}
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/x~01y"}
+                                }
+                            }
+                        }
+                    },
+                }
+            }
+        },
+        "components": {
+            "parameters": {"a/b": {"name": "slash", "in": "query"}},
+            "schemas": {"c~d": {"type": "string"}, "x~1y": {"type": "integer"}},
+        },
+    }
+    post = operation(spec, "/x", "post")
+    assert post["parameters"][0]["name"] == "slash"  # ~1 is "/"
+    assert post["requestBody"] == {"type": "string"}  # ~0 is "~"
+    assert post["response"] == {"type": "integer"}  # ~01 is "~1", not "/"
+
+
+def test_null_fields_in_an_operation_are_tolerated():
+    spec = {
+        "paths": {
+            "/x": {
+                "get": {
+                    "parameters": [
+                        {"name": "q", "in": "query", "description": None},
+                        {"name": "bare", "in": "query"},
+                    ],
+                    "requestBody": None,
+                    "responses": {"200": None},
+                }
+            }
+        }
+    }
+    got = operation(spec, "/x", "get")
+    assert [(p["name"], p["description"], p["schema"]) for p in got["parameters"]] == [
+        ("q", None, None),
+        ("bare", None, None),
+    ]
+    assert got["requestBody"] is None
+    assert got["response"] is None

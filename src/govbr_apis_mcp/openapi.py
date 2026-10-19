@@ -7,7 +7,10 @@ a catalog entry read or overwrite arbitrary .json files on disk — so editing a
 entry's openapi_url takes effect at once instead of after the TTL.
 
 Redirects are followed by hand: every hop, the first URL included, must be https on
-an allowlisted host before it is requested, and bodies are capped at MAX_SPEC_BYTES.
+an allowlisted host before it is requested. The download is bounded three ways: bodies
+are capped at MAX_SPEC_BYTES counted on the wire (compressed responses are refused, as
+a few bytes of gzip inflate to gigabytes before any cap could look), and the whole thing
+has a deadline, since the client's timeout only covers each socket operation.
 
 Summaries are deliberately compact: a full spec (Portal da Transparência's is
 ~185 KB) would crowd out the MCP client's context.
@@ -31,7 +34,9 @@ from .catalog import host_allowed
 CACHE_TTL_SECONDS = 24 * 3600
 MAX_SPEC_BYTES = 5 * 1024 * 1024
 MAX_REDIRECTS = 5
+DOWNLOAD_DEADLINE_SECONDS = 60
 HTTP_METHODS = ("get", "post", "put", "patch", "delete")
+_TOO_DEEP = "spec too deeply nested"
 
 
 def _cache_dir() -> Path:
@@ -54,46 +59,80 @@ def fetch_spec(api_id: str, openapi_url: str, client: httpx.Client) -> dict[str,
         except (json.JSONDecodeError, OSError):
             cache_file.unlink(missing_ok=True)  # corrupted cache repairs itself
 
-    spec = _parse_spec(_download(api_id, openapi_url, client))
-    text = json.dumps(spec, default=str)  # YAML can carry dates, which JSON cannot
+    text, spec = _round_trip(_parse_spec(_download(api_id, openapi_url, client)))
     _write_atomic(cache_file, text)
-    return json.loads(text)  # what a later cache hit returns: dates and int keys as strings
+    return spec
+
+
+def _round_trip(spec: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """The spec as JSON text, and as the dict a later cache hit reads back from that text.
+
+    YAML can carry what JSON cannot: dates and int keys come out as strings, so the first
+    call and every cache hit see the same thing."""
+    try:
+        text = json.dumps(spec, default=str)
+        return text, json.loads(text)
+    except TypeError:  # a key such as the YAML date 2024-01-01 cannot become a JSON key
+        raise ValueError("unsupported key types in spec") from None
+    except RecursionError:
+        raise ValueError(_TOO_DEEP) from None
 
 
 def _download(api_id: str, url: str, client: httpx.Client) -> bytes:
     """GET a spec, following redirects by hand so that every hop is checked before it is
-    requested, and reading at most MAX_SPEC_BYTES."""
+    requested, and reading at most MAX_SPEC_BYTES within DOWNLOAD_DEADLINE_SECONDS."""
+    deadline = time.monotonic() + DOWNLOAD_DEADLINE_SECONDS
     try:
         current = httpx.URL(url)
     except httpx.InvalidURL as exc:
         raise ValueError(f"Spec fetch for {api_id}: invalid spec URL {url!r} ({exc})") from None
     for _ in range(MAX_REDIRECTS + 1):
+        _check_deadline(api_id, deadline)
         if current.scheme != "https" or not host_allowed(str(current)):
             raise ValueError(
                 f"Spec fetch for {api_id} refused {current}: spec and redirect URLs "
                 "must be https on an allowlisted host"
             )
         try:
-            with client.stream("GET", current, follow_redirects=False) as resp:
+            with client.stream(
+                "GET", current, headers={"Accept-Encoding": "identity"}, follow_redirects=False
+            ) as resp:
                 if resp.next_request is None:
                     resp.raise_for_status()
-                    return _read_capped(api_id, resp)
+                    return _read_capped(api_id, resp, deadline)
                 current = resp.next_request.url
-        except httpx.RemoteProtocolError as exc:
-            if "location header" not in str(exc):  # only httpx refusing to parse a redirect
-                raise
-            raise ValueError(f"Spec fetch for {api_id}: {exc}") from None
+        except (httpx.InvalidURL, httpx.RemoteProtocolError, UnicodeError) as exc:
+            # httpx builds the redirect target itself, and fails on a Location it cannot parse
+            if isinstance(exc, httpx.RemoteProtocolError) and "location header" not in str(exc):
+                raise  # a genuine protocol error (dropped connection...), not a bad redirect
+            raise ValueError(
+                f"Spec fetch for {api_id}: invalid redirect from {current} ({exc})"
+            ) from None
     raise ValueError(f"Spec fetch for {api_id} followed more than {MAX_REDIRECTS} redirects")
 
 
-def _read_capped(api_id: str, resp: httpx.Response) -> bytes:
+def _check_deadline(api_id: str, deadline: float) -> None:
+    if time.monotonic() > deadline:
+        raise ValueError(
+            f"Spec fetch for {api_id}: spec download exceeded {DOWNLOAD_DEADLINE_SECONDS} s"
+        )
+
+
+def _read_capped(api_id: str, resp: httpx.Response, deadline: float) -> bytes:
+    encoding = resp.headers.get("content-encoding")
+    if encoding and encoding.strip().lower() != "identity":
+        raise ValueError(
+            f"Spec fetch for {api_id}: compressed spec responses are not supported "
+            f"(Content-Encoding: {encoding})"
+        )
     body = bytearray()
-    for chunk in resp.iter_bytes():
+    for chunk in resp.iter_raw():  # bytes as they travel: nothing is inflated before counting
         body += chunk
         if len(body) > MAX_SPEC_BYTES:
             raise ValueError(
                 f"Spec fetch for {api_id}: spec too large (over {MAX_SPEC_BYTES} bytes)"
             )
+        _check_deadline(api_id, deadline)
     return bytes(body)
 
 
@@ -108,17 +147,28 @@ class _NoAliasLoader(yaml.SafeLoader):
         return super().compose_node(parent, index)
 
 
+def _load_yaml(body: bytes) -> Any:
+    try:
+        return yaml.load(body, Loader=_NoAliasLoader)
+    except yaml.YAMLError:
+        return None
+    except RecursionError:
+        raise ValueError(_TOO_DEEP) from None
+
+
 def _parse_spec(body: bytes) -> dict[str, Any]:
-    """Specs come as JSON or YAML, and servers rarely label them right: sniff the body."""
+    """Specs come as JSON or YAML, and servers rarely label them right: sniff the body.
+
+    Known limitation: PyYAML types scalars by YAML 1.1, so in a YAML spec `on`, `off`, `yes`
+    and `no` come out as booleans, 1.10 as 1.1 and 010 as 8. JSON specs are not affected."""
     problem = "not an OpenAPI document"
     try:
         spec = json.loads(body)
     except ValueError as exc:  # JSONDecodeError and UnicodeDecodeError
         problem += f" (not JSON: {exc})"
-        try:
-            spec = yaml.load(body, Loader=_NoAliasLoader)
-        except yaml.YAMLError:
-            spec = None
+        spec = _load_yaml(body)
+    except RecursionError:
+        raise ValueError(_TOO_DEEP) from None
     if not isinstance(spec, dict) or not ({"openapi", "swagger"} & spec.keys()):
         raise ValueError(problem)
     return spec
@@ -206,13 +256,16 @@ def _describe_param(spec: dict[str, Any], param: dict[str, Any]) -> dict[str, An
     schema = param.get("schema")
     if schema is None:  # Swagger 2.0 declares the type on the parameter itself
         schema = {k: param[k] for k in ("type", "format", "enum", "items") if k in param} or None
-    return {
+    described = {
         "name": param.get("name"),
         "in": param.get("in"),
         "required": param.get("required", False),
         "schema": _resolve(spec, schema, depth=1),
         "description": (param.get("description") or "")[:200] or None,
     }
+    if isinstance(param.get("$ref"), str):  # a pointer that could not be followed: say which
+        described["$ref"] = param["$ref"]
+    return described
 
 
 def _body_schema(op: dict[str, Any], body_param: dict[str, Any] | None) -> dict[str, Any] | None:
