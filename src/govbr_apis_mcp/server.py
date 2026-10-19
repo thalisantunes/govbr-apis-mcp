@@ -208,6 +208,8 @@ def call_api(
         request_headers.update(auth_module.build_headers(entry, _client))
     except auth_module.MissingCredentialsError as exc:
         return {"error": str(exc), "credentials": auth_module.credentials_status(entry)}
+    except auth_module.TokenError as exc:
+        return {"error": str(exc), "token_url": entry.auth_config.get("token_url")}
 
     try:
         result = _send(method, url, params, body, request_headers)

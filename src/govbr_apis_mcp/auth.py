@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import base64
 import os
+import threading
 import time
 
 import httpx
@@ -25,7 +26,12 @@ class MissingCredentialsError(Exception):
     pass
 
 
+class TokenError(Exception):
+    """The OAuth2 token endpoint failed. Messages never carry the response body."""
+
+
 _token_cache: dict[str, tuple[str, float]] = {}
+_token_lock = threading.Lock()  # the SDK runs sync tools in a thread pool
 
 
 def credentials_status(entry: ApiEntry) -> dict[str, object]:
@@ -65,7 +71,8 @@ def _api_key_headers(entry: ApiEntry) -> dict[str, str]:
 
 
 def _oauth2_token(entry: ApiEntry, client: httpx.Client) -> str:
-    cached = _token_cache.get(entry.id)
+    with _token_lock:
+        cached = _token_cache.get(entry.id)
     if cached and cached[1] > time.monotonic():
         return cached[0]
 
@@ -85,15 +92,26 @@ def _oauth2_token(entry: ApiEntry, client: httpx.Client) -> str:
         )
 
     basic = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
-    resp = client.post(
-        cfg["token_url"],
-        data={"grant_type": "client_credentials"},
-        headers={"Authorization": f"Basic {basic}"},
-    )
-    resp.raise_for_status()
-    payload = resp.json()
-    token = payload["access_token"]
-    ttl = int(payload.get("expires_in", 300))
+    try:
+        resp = client.post(
+            cfg["token_url"],
+            data={"grant_type": "client_credentials"},
+            headers={"Authorization": f"Basic {basic}"},
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        token = payload["access_token"]
+        if not token or not isinstance(token, str):
+            raise KeyError("access_token")
+        ttl = int(payload.get("expires_in", 300))
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        raise TokenError(f"{entry.id}: token endpoint returned HTTP {status}") from None
+    except httpx.HTTPError as exc:
+        raise TokenError(f"{entry.id}: token request failed ({type(exc).__name__})") from None
+    except (ValueError, KeyError, TypeError):
+        raise TokenError(f"{entry.id}: token endpoint returned no access_token") from None
     if ttl > 60:  # short-lived tokens are not cached — serving an expired one is worse
-        _token_cache[entry.id] = (token, time.monotonic() + ttl - 30)
+        with _token_lock:
+            _token_cache[entry.id] = (token, time.monotonic() + ttl - 30)
     return token

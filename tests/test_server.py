@@ -252,6 +252,25 @@ def test_oauth_api_gets_a_bearer_token(oauth_api, wire):
     assert requests[1].headers["authorization"] == "Bearer tok"
 
 
+def test_token_failure_is_reported_as_a_tool_error(oauth_api, wire):
+    requests = wire(lambda request: httpx.Response(401, text="LEAKY-BODY"))
+    out = server.call_api("oauth-demo", "/things")
+    assert out == {
+        "error": "oauth-demo: token endpoint returned HTTP 401",
+        "token_url": "https://auth.demo.gov.br/token",
+    }
+    assert [r.url.path for r in requests] == ["/token"]  # the API itself was never called
+
+
+def test_missing_credentials_are_reported_with_their_status(catalog, wire, monkeypatch):
+    monkeypatch.delenv("TRANSPARENCIA_API_KEY", raising=False)
+    requests = wire()
+    out = server.call_api("portal-transparencia", "/api-de-dados/viagens")
+    assert "TRANSPARENCIA_API_KEY" in out["error"]
+    assert out["credentials"]["ready"] is False
+    assert requests == []
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
