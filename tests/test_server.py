@@ -1,5 +1,7 @@
 """Tests for the MCP tool layer — URL construction, header precedence, redaction."""
 
+import dataclasses
+
 import httpx
 import pytest
 
@@ -240,6 +242,66 @@ def test_call_api_blocks_not_callable(monkeypatch):
     monkeypatch.setattr(server, "_catalog", Catalog.load())
     out = server.call_api("conecta-consulta-cnpj", "/basica/1")
     assert "not callable" in out["error"]
+
+
+SERPRO_CNPJ = "serpro-consulta-cnpj"
+SERPRO_ENV = ("SERPRO_CNPJ_CLIENT_ID", "SERPRO_CNPJ_CLIENT_SECRET")
+
+
+def test_requires_contract_api_is_callable_once_its_credentials_are_set(catalog, wire, monkeypatch):
+    monkeypatch.setattr(auth, "_token_cache", {})
+    for var in SERPRO_ENV:
+        monkeypatch.setenv(var, "x")
+    requests = wire(
+        lambda request: (
+            httpx.Response(200, json={"access_token": "tok", "expires_in": 3600})
+            if request.url.path == "/token"
+            else httpx.Response(200, json={"cnpj": "00000000000191"})
+        )
+    )
+    out = server.call_api(SERPRO_CNPJ, "/basica/00000000000191")
+    assert out["status"] == 200
+    assert out["body"] == {"cnpj": "00000000000191"}
+    assert [(r.url.host, r.url.path) for r in requests] == [
+        ("gateway.apiserpro.serpro.gov.br", "/token"),
+        ("gateway.apiserpro.serpro.gov.br", "/consulta-cnpj-df/v2/basica/00000000000191"),
+    ]
+    assert requests[1].headers["authorization"] == "Bearer tok"
+
+
+def test_requires_contract_api_without_credentials_says_which_are_missing(
+    catalog, wire, monkeypatch
+):
+    monkeypatch.delenv("SERPRO_CNPJ_CLIENT_ID", raising=False)
+    monkeypatch.setenv("SERPRO_CNPJ_CLIENT_SECRET", "x")
+    requests = wire()
+    out = server.call_api(SERPRO_CNPJ, "/basica/00000000000191")
+    assert out["error"] == "serpro-consulta-cnpj is not callable (status: requires_contract)."
+    assert "SERPRO_CNPJ_CLIENT_ID" in out["hint"]
+    assert "SERPRO_CNPJ_CLIENT_SECRET" not in out["hint"]  # that one is set
+    assert requests == []
+
+
+def test_requires_contract_api_without_base_url_stays_not_callable(monkeypatch, wire):
+    for var in SERPRO_ENV:
+        monkeypatch.setenv(var, "x")
+    entry = dataclasses.replace(Catalog.load().get(SERPRO_CNPJ), base_url=None)
+    monkeypatch.setattr(server, "_catalog", Catalog({entry.id: entry}))
+    requests = wire()
+    out = server.call_api(SERPRO_CNPJ, "/basica/00000000000191")
+    assert "not callable" in out["error"]
+    assert requests == []
+
+
+def test_credentials_status_says_whether_call_api_accepts_the_entry(catalog, monkeypatch):
+    for var in SERPRO_ENV:
+        monkeypatch.delenv(var, raising=False)
+    [item] = server.credentials_status(SERPRO_CNPJ)
+    assert (item["ready"], item["callable"]) == (False, False)
+    for var in SERPRO_ENV:
+        monkeypatch.setenv(var, "x")
+    [item] = server.credentials_status(SERPRO_CNPJ)
+    assert (item["ready"], item["callable"]) == (True, True)
 
 
 def test_call_api_unknown_id_returns_error_dict(monkeypatch):

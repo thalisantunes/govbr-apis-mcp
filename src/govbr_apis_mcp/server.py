@@ -166,7 +166,8 @@ def call_api(
     DELETE or OPTIONS. `body` is sent as JSON — only use it with methods that accept a
     payload (POST/PUT/PATCH). `headers` adds request headers; credentials, Host and
     connection-framing headers are managed by the gateway, and any you send come back
-    listed in `ignored_headers`.
+    listed in `ignored_headers`. A requires_contract API (Serpro) is accepted once its
+    credential env vars are set.
 
     Returns {status, url, body}; JSON bodies come back parsed, others as text,
     truncated at 60k chars. Redirects are not followed: a 3xx result carries the target
@@ -179,10 +180,17 @@ def call_api(
     except KeyError as exc:
         return {"error": str(exc)}
 
-    if not entry.callable:
+    if not _callable_now(entry):
+        hint = entry.notes or entry.docs_url
+        if entry.status == "requires_contract" and entry.base_url is not None:
+            env_vars = auth_module.credentials_status(entry)["env_vars"]
+            missing = [var for var, is_set in env_vars.items() if not is_set]
+            if missing:
+                setup = f"Set {', '.join(missing)} to use your contract credentials."
+                hint = " ".join(filter(None, [setup, hint]))
         return {
             "error": f"{entry.id} is not callable (status: {entry.status}).",
-            "hint": entry.notes or entry.docs_url,
+            "hint": hint,
         }
 
     # Validate everything the caller controls before touching credentials, so a bad
@@ -227,7 +235,12 @@ def call_api(
 @mcp.tool()
 def credentials_status(api_id: str | None = None) -> list[dict[str, Any]]:
     """Show which APIs have credentials configured. Without api_id, reports every
-    catalog entry that requires auth, so you can see what is ready to call."""
+    catalog entry that requires auth, so you can see what is ready to call.
+
+    `ready` says whether the credential env vars are set; `callable` whether call_api
+    accepts the entry right now (a requires_contract entry, such as Serpro's, only does
+    once they are).
+    """
     catalog = get_catalog()
     try:
         entries = (
@@ -237,7 +250,27 @@ def credentials_status(api_id: str | None = None) -> list[dict[str, Any]]:
         )
     except KeyError as exc:
         return [{"error": str(exc)}]
-    return [{"id": e.id, "status": e.status, **auth_module.credentials_status(e)} for e in entries]
+    return [
+        {
+            "id": e.id,
+            "status": e.status,
+            **auth_module.credentials_status(e),
+            "callable": _callable_now(e),
+        }
+        for e in entries
+    ]
+
+
+def _callable_now(entry: ApiEntry) -> bool:
+    """Whether call_api accepts the entry: available/unstable ones, plus requires_contract
+    ones once their credentials are in the environment (a Serpro contract is just that)."""
+    if entry.callable:
+        return True
+    return (
+        entry.status == "requires_contract"
+        and entry.base_url is not None
+        and bool(auth_module.credentials_status(entry)["ready"])
+    )
 
 
 def _caller_headers(
