@@ -75,7 +75,7 @@ jobs:
           tree = Path(os.environ["GITHUB_WORKSPACE"]) / "src/govbr_apis_mcp/catalog_data"
           expected = sum(
               len((yaml.safe_load(path.read_text(encoding="utf-8")) or {}).get("apis", []))
-              for path in tree.glob("*.yaml")
+              for path in [*tree.glob("*.yaml"), *tree.glob("*.yml")]
           )
           # The smoke proves the wheel is self-sufficient: ignore operator overrides.
           for var in ("GOVBR_CATALOG_DIR", "GOVBR_EXTRA_CATALOG_DIR", "GOVBR_EXTRA_ALLOWED_HOSTS"):

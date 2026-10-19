@@ -128,11 +128,11 @@ def main(argv: list[str] | None = None) -> None:
             file=sys.stderr,
         )
         sys.exit(1)
-    invalid = [api["id"] for api in apis if not ID_RE.match(api["id"])]
+    invalid = [api["id"] for api in apis if not ID_RE.fullmatch(api["id"])]
     if invalid:
         print(
             f"error: {len(invalid)} id(s) the catalog would reject "
-            f"(must match {ID_RE.pattern}): {', '.join(invalid)}; "
+            f"(must match {ID_RE.pattern}): {', '.join(map(repr, invalid))}; "
             f"{out_path} was left untouched",
             file=sys.stderr,
         )

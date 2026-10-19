@@ -73,6 +73,25 @@ def test_an_id_the_catalog_would_reject_aborts_and_is_listed(
     assert out.read_text(encoding="utf-8") == CURRENT
 
 
+def test_an_id_with_a_trailing_newline_is_rejected(scraper, monkeypatch, tmp_path, capsys):
+    # str.match accepts it ($ matches before a final newline) and Catalog.load then refuses
+    # the file, which uses fullmatch.
+    out = tmp_path / "conecta.yaml"
+    out.write_text(CURRENT, encoding="utf-8")
+    scrape_aborts(scraper, monkeypatch, out, card("ok-one") + card("with-newline\n"))
+    err = capsys.readouterr().err
+    assert "'conecta-with-newline\\n'" in err
+    assert "conecta-ok-one" not in err
+    assert out.read_text(encoding="utf-8") == CURRENT
+
+
+def test_force_does_not_skip_the_id_check(scraper, monkeypatch, tmp_path):
+    out = tmp_path / "conecta.yaml"
+    out.write_text(CURRENT, encoding="utf-8")
+    scrape_aborts(scraper, monkeypatch, out, card("Bad_Upper"), "--force")
+    assert out.read_text(encoding="utf-8") == CURRENT
+
+
 def test_losing_more_than_half_the_entries_aborts_unless_forced(
     scraper, monkeypatch, tmp_path, capsys
 ):
