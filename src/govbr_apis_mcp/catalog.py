@@ -111,6 +111,23 @@ class ApiEntry:
                 f"{where}: invalid id — must match {ID_RE.pattern} "
                 "(ids become cache lookup keys and must not contain path separators)"
             )
+        for name, value, expected, fits in (
+            ("description", self.description, "a string", isinstance(self.description, str)),
+            (
+                "tags",
+                self.tags,
+                "a list of strings",
+                isinstance(self.tags, list) and all(isinstance(tag, str) for tag in self.tags),
+            ),
+            (
+                "notes",
+                self.notes,
+                "a string or absent",
+                self.notes is None or isinstance(self.notes, str),
+            ),
+        ):
+            if not fits:
+                raise ValueError(f"{where}: {name} must be {expected} — got {value!r}")
         for name, value, allowed in (
             ("category", self.category, CATEGORIES),
             ("status", self.status, STATUSES),
@@ -222,6 +239,8 @@ class Catalog:
         for path in sorted([*directory.glob("*.yaml"), *directory.glob("*.yml")]):
             try:
                 data = yaml.safe_load(path.read_text(encoding="utf-8"))
+            except UnicodeDecodeError as exc:
+                raise ValueError(f"{path.name}: not valid UTF-8 — {exc}") from None
             except yaml.YAMLError as exc:
                 raise ValueError(f"{path.name}: not valid YAML — {exc}") from None
             if data is not None and not isinstance(data, dict):  # None is an empty file
@@ -229,7 +248,10 @@ class Catalog:
                     f"{path.name}: expected a mapping with an `apis:` list at the top, "
                     f"got {type(data).__name__}"
                 )
-            for raw in (data or {}).get("apis") or []:
+            apis = (data or {}).get("apis")
+            if apis is not None and not isinstance(apis, list):
+                raise ValueError(f"{path.name}: `apis:` must be a list, got {type(apis).__name__}")
+            for raw in apis or []:
                 try:
                     entry = ApiEntry(**raw)
                 except TypeError as exc:

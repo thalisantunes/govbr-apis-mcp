@@ -56,8 +56,8 @@ def fetch_spec(api_id: str, openapi_url: str, client: httpx.Client) -> dict[str,
     if cache_file.exists() and time.time() - cache_file.stat().st_mtime < CACHE_TTL_SECONDS:
         try:
             return json.loads(cache_file.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            cache_file.unlink(missing_ok=True)  # corrupted cache repairs itself
+        except (ValueError, OSError):  # not JSON, not UTF-8, unreadable: fetch it again
+            cache_file.unlink(missing_ok=True)
 
     text, spec = _round_trip(_parse_spec(_download(api_id, openapi_url, client)))
     _write_atomic(cache_file, text)
@@ -85,12 +85,14 @@ def _download(api_id: str, url: str, client: httpx.Client) -> bytes:
     try:
         current = httpx.URL(url)
     except httpx.InvalidURL as exc:
-        raise ValueError(f"Spec fetch for {api_id}: invalid spec URL {url!r} ({exc})") from None
+        raise ValueError(
+            f"Spec fetch for {api_id}: invalid spec URL {_clip(url)!r} ({_clip(exc)})"
+        ) from None
     for _ in range(MAX_REDIRECTS + 1):
         _check_deadline(api_id, deadline)
         if current.scheme != "https" or not host_allowed(str(current)):
             raise ValueError(
-                f"Spec fetch for {api_id} refused {current}: spec and redirect URLs "
+                f"Spec fetch for {api_id} refused {_clip(current)}: spec and redirect URLs "
                 "must be https on an allowlisted host"
             )
         try:
@@ -106,9 +108,18 @@ def _download(api_id: str, url: str, client: httpx.Client) -> bytes:
             if isinstance(exc, httpx.RemoteProtocolError) and "location header" not in str(exc):
                 raise  # a genuine protocol error (dropped connection...), not a bad redirect
             raise ValueError(
-                f"Spec fetch for {api_id}: invalid redirect from {current} ({exc})"
+                f"Spec fetch for {api_id}: invalid redirect from {_clip(current)} ({_clip(exc)})"
             ) from None
     raise ValueError(f"Spec fetch for {api_id} followed more than {MAX_REDIRECTS} redirects")
+
+
+def _clip(value: object, limit: int = 200) -> str:
+    """What an error message quotes from the wire: a server can send tens of thousands of
+    characters of URL."""
+    text = str(value)
+    return (
+        text if len(text) <= limit else f"{text[:limit]}... ({len(text) - limit} more characters)"
+    )
 
 
 def _check_deadline(api_id: str, deadline: float) -> None:
@@ -189,7 +200,7 @@ def summarize_spec(spec: dict[str, Any]) -> dict[str, Any]:
     """One line per operation: method, path, summary."""
     operations = []
     for path, methods in (spec.get("paths") or {}).items():
-        for method, op in methods.items():
+        for method, op in (methods or {}).items():
             if method.lower() not in HTTP_METHODS or not isinstance(op, dict):
                 continue
             operations.append(
@@ -199,24 +210,25 @@ def summarize_spec(spec: dict[str, Any]) -> dict[str, Any]:
                     "summary": op.get("summary") or (op.get("description") or "")[:120] or None,
                 }
             )
-    info = spec.get("info", {})
+    info = spec.get("info") or {}
     return {
         "title": info.get("title"),
         "version": info.get("version"),
-        "servers": [s.get("url") for s in spec.get("servers", []) if isinstance(s, dict)],
+        "servers": [s.get("url") for s in (spec.get("servers") or []) if isinstance(s, dict)],
         "operations": operations,
     }
 
 
 def describe_operation(spec: dict[str, Any], path: str, method: str | None) -> dict[str, Any]:
     """Detail of one path (or one operation): parameters, request body, response schema."""
-    methods = (spec.get("paths") or {}).get(path)
-    if methods is None:
-        available = list((spec.get("paths") or {}).keys())
+    paths = spec.get("paths") or {}
+    if path not in paths:
+        available = list(paths)
         raise KeyError(
             f"Path {path!r} not in spec — use the templated path exactly as listed "
             f"(e.g. '/viagens/{{id}}', not '/viagens/123'). Available: {available[:40]}"
         )
+    methods = paths[path] or {}  # an empty path item is null in YAML
 
     # Parameters may be declared once for the whole path item and inherited by each
     # operation (valid OpenAPI); merge them in so they are not lost.
@@ -268,25 +280,37 @@ def _describe_param(spec: dict[str, Any], param: dict[str, Any]) -> dict[str, An
     return described
 
 
-def _body_schema(op: dict[str, Any], body_param: dict[str, Any] | None) -> dict[str, Any] | None:
-    content = (op.get("requestBody") or {}).get("content") or {}
+def _content_schema(content: Any) -> Any:
+    """The schema of an OpenAPI 3 `content` map: application/json when it is there, else the
+    first media type. A media type can be empty (null in YAML)."""
+    content = content or {}
     for media in ("application/json", *content):
         if media in content:
-            return content[media].get("schema")
-    return (body_param or {}).get("schema")  # Swagger 2.0: the body is a parameter
+            return (content[media] or {}).get("schema")
+    return None
+
+
+def _body_schema(op: dict[str, Any], body_param: dict[str, Any] | None) -> dict[str, Any] | None:
+    schema = _content_schema((op.get("requestBody") or {}).get("content"))
+    if schema is None:  # Swagger 2.0: the body is a parameter
+        schema = (body_param or {}).get("schema")
+    return schema
 
 
 def _response_schema(op: dict[str, Any]) -> dict[str, Any] | None:
+    """The schema of the first 2xx response that has one, 200 and 201 ahead of the rest.
+
+    An error or `default` response does not describe what a call returns, so without a 2xx
+    schema there is none: a DELETE that answers 204 must not show its error body instead."""
     responses = op.get("responses") or {}
-    for code in ("200", "201", "default", *responses):
-        if code in responses:
-            response = responses[code] or {}
-            content = response.get("content") or {}
-            for media in ("application/json", *content):
-                if media in content:
-                    return content[media].get("schema")
-            if "schema" in response:  # Swagger 2.0 puts the schema on the response itself
-                return response["schema"]
+    success = [code for code in responses if str(code).startswith("2")]
+    for code in sorted(success, key=lambda code: {"200": 0, "201": 1}.get(str(code), 2)):
+        response = responses[code] or {}
+        schema = _content_schema(response.get("content"))
+        if schema is None:
+            schema = response.get("schema")  # Swagger 2.0 puts the schema on the response
+        if schema is not None:
+            return schema
     return None
 
 

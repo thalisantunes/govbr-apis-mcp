@@ -263,6 +263,31 @@ def test_a_malformed_catalog_file_is_a_value_error_that_names_it(
         Catalog.load(tmp_path / "base")
 
 
+def test_a_catalog_file_that_is_not_utf8_is_a_value_error_that_names_it(tmp_path, clean_env):
+    (tmp_path / "base").mkdir()
+    latin1 = "apis:\n  - {id: demo, name: café}\n".encode("latin-1")
+    (tmp_path / "base" / "latin.yaml").write_bytes(latin1)
+    with pytest.raises(ValueError, match=r"latin\.yaml: not valid UTF-8"):
+        Catalog.load(tmp_path / "base")
+
+
+@pytest.mark.parametrize(
+    ("content", "got"),
+    [("apis: 5\n", "int"), ("apis: 0\n", "int"), ("apis: text\n", "str"), ("apis: {}\n", "dict")],
+)
+def test_apis_must_be_a_list_and_the_error_names_the_file(content, got, tmp_path, clean_env):
+    (tmp_path / "base").mkdir()
+    (tmp_path / "base" / "bad.yaml").write_text(content, encoding="utf-8")
+    with pytest.raises(ValueError, match=rf"bad\.yaml: `apis:` must be a list, got {got}"):
+        Catalog.load(tmp_path / "base")
+
+
+def test_an_entry_with_a_null_description_is_refused_at_load_with_file_and_id(tmp_path, clean_env):
+    write_catalog(tmp_path / "base", "x.yaml", demo_entry(description=None))
+    with pytest.raises(ValueError, match=r"x\.yaml:demo: description must be a string"):
+        Catalog.load(tmp_path / "base")
+
+
 def test_list_rejects_unknown_filters(catalog: Catalog):
     with pytest.raises(ValueError, match="Unknown status 'nope'"):
         catalog.list(status="nope")
@@ -311,6 +336,13 @@ REJECTED_ENTRIES = [
     # callable statuses need somewhere to call
     ({"status": "available", "base_url": None}, "status=available requires base_url"),
     ({"status": "unstable", "base_url": None}, "status=unstable requires base_url"),
+    # search() and get() read these, so a null or a wrong type must not get past load
+    ({"description": None}, "description must be a string"),
+    ({"description": 5}, "description must be a string"),
+    ({"tags": None}, "tags must be a list of strings"),
+    ({"tags": "single"}, "tags must be a list of strings"),
+    ({"tags": ["fine", 3]}, "tags must be a list of strings"),
+    ({"notes": 7}, "notes must be a string or absent"),
 ]
 
 
@@ -347,6 +379,7 @@ def test_validate_accepts_well_formed_entries(clean_env):
         {"openapi_url": "https://api.demo.gov.br/spec.json", "docs_url": "https://demo.gov.br/d"},
         # a stub: nothing to call yet, so no base_url and no token_url required
         {"status": "requires_public_entity", "base_url": None, "auth": "oauth2_client_credentials"},
+        {"description": "text", "tags": ["a", "b"], "notes": "a note"},
     ):
         ApiEntry(**demo_entry(**fields)).validate("test.yaml")
 

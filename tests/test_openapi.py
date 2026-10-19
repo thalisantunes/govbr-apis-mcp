@@ -186,6 +186,31 @@ def test_a_location_httpx_cannot_parse_is_a_value_error(location):
     assert requested == [SPEC_URL]
 
 
+HUGE = "a" * 60_000  # httpx lets URLs up to 64 KiB through, and a server chooses the Location
+
+
+def test_a_refused_hop_does_not_echo_a_huge_url():
+    client, _ = make_client(lambda request: redirect("https://evil.example.com/" + HUGE))
+    with pytest.raises(ValueError, match="refused https://evil.example.com/a+") as err:
+        fetch_spec("demo", SPEC_URL, client)
+    assert len(str(err.value)) < 600
+
+
+def test_an_invalid_redirect_does_not_echo_a_huge_url():
+    routes = {SPEC_URL: redirect("https://api.demo.gov.br/" + HUGE)}
+    client, _ = make_client(lambda request: routes.get(str(request.url)) or redirect("https:foo"))
+    with pytest.raises(ValueError, match="invalid redirect from") as err:
+        fetch_spec("demo", SPEC_URL, client)
+    assert len(str(err.value)) < 600
+
+
+def test_an_invalid_spec_url_does_not_echo_a_huge_url():
+    client, _ = make_client(lambda request: ok())
+    with pytest.raises(ValueError, match="invalid spec URL") as err:
+        fetch_spec("demo", "https://api.demo.gov.br:evil/" + HUGE, client)
+    assert len(str(err.value)) < 600
+
+
 def test_a_genuine_protocol_error_is_not_passed_off_as_a_bad_redirect():
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.RemoteProtocolError(
@@ -423,21 +448,42 @@ def test_a_yaml_key_that_is_a_date_is_a_value_error(cache_home):
     assert not list(cache_home.glob("*"))
 
 
-@pytest.mark.parametrize("body", [b"[" * 300_000, b"x: " + b"[" * 100_000], ids=["json", "yaml"])
-def test_absurdly_nested_documents_are_value_errors(body, cache_home):
-    client, _ = make_client(lambda request: httpx.Response(200, content=body))
+def too_deep(*args, **kwargs):
+    raise RecursionError("maximum recursion depth exceeded")
+
+
+# Where json raises RecursionError depends on the Python build (3.12 counts C recursion on its
+# own, 3.14 derives the limit from the real stack), so a document sized for one limit proves
+# nothing on another. The parsers are made to give up instead.
+def test_json_past_the_recursion_limit_is_a_value_error(monkeypatch, cache_home):
+    monkeypatch.setattr(openapi.json, "loads", too_deep)
+    client, _ = make_client(lambda request: httpx.Response(200, content=b"[[[[]]]]"))
     with pytest.raises(ValueError, match="spec too deeply nested"):
         fetch_spec("demo", SPEC_URL, client)
     assert not list(cache_home.glob("*"))
 
 
-def test_serializing_an_absurdly_nested_spec_is_a_value_error():
-    deep = current = {"openapi": "3.0.0"}
-    for _ in range(50_000):
-        current["next"] = {}
-        current = current["next"]
+def test_yaml_past_the_recursion_limit_is_a_value_error(monkeypatch, cache_home):
+    monkeypatch.setattr(openapi.yaml, "load", too_deep)
+    client, _ = make_client(lambda request: httpx.Response(200, content=b"openapi: 3.0.0"))
     with pytest.raises(ValueError, match="spec too deeply nested"):
-        openapi._round_trip(deep)
+        fetch_spec("demo", SPEC_URL, client)
+    assert not list(cache_home.glob("*"))
+
+
+def test_pyyaml_itself_gives_up_on_absurd_nesting(cache_home):
+    """PyYAML recurses in Python code, so its limit is sys.getrecursionlimit() on every build."""
+    body = b"x: " + b"[" * 100_000
+    client, _ = make_client(lambda request: httpx.Response(200, content=body))
+    with pytest.raises(ValueError, match="spec too deeply nested"):
+        fetch_spec("demo", SPEC_URL, client)
+
+
+@pytest.mark.parametrize("function", ["dumps", "loads"])
+def test_serializing_past_the_recursion_limit_is_a_value_error(function, monkeypatch):
+    monkeypatch.setattr(openapi.json, function, too_deep)
+    with pytest.raises(ValueError, match="spec too deeply nested"):
+        openapi._round_trip(SPEC)
 
 
 # --- cache key ----------------------------------------------------------------------------
@@ -478,10 +524,11 @@ def test_cache_entries_live_24_hours(age_hours, fetched_again):
     assert len(requested) == (2 if fetched_again else 1)
 
 
-def test_a_corrupted_cache_file_is_repaired_by_fetching_again():
+@pytest.mark.parametrize("garbage", [b"{not json", b"\xff\xfe\x00 not text"], ids=["json", "utf8"])
+def test_a_corrupted_cache_file_is_repaired_by_fetching_again(garbage):
     client, requested = make_client(lambda request: ok())
     path = openapi.cache_path("demo", SPEC_URL)
-    path.write_text("{not json", encoding="utf-8")
+    path.write_bytes(garbage)
     assert fetch_spec("demo", SPEC_URL, client) == SPEC
     assert len(requested) == 1
     assert json.loads(path.read_text(encoding="utf-8")) == SPEC
@@ -672,11 +719,13 @@ def test_properties_named_like_schema_keywords_are_kept():
                 "Doc": {
                     "type": "object",
                     "example": {"example": "a sample, dropped"},
+                    "examples": [{"example": "samples, dropped"}],
+                    "xml": {"name": "Doc"},
                     "properties": {
                         "example": {"type": "string", "example": "sample of a property"},
                         "examples": {"type": "string"},
                         "xml": {"type": "string", "xml": {"attribute": True}},
-                        "name": {"type": "string", "example": "Ana"},
+                        "name": {"type": "string", "example": "Ana", "examples": ["Ana", "Bia"]},
                     },
                 }
             }
@@ -806,3 +855,92 @@ def test_null_fields_in_an_operation_are_tolerated():
     ]
     assert got["requestBody"] is None
     assert got["response"] is None
+
+
+GOOD = {"type": "object", "properties": {"id": {"type": "integer"}}}
+OTHER = {"type": "object", "properties": {"other": {"type": "string"}}}
+ERR = {"type": "object", "properties": {"message": {"type": "string"}}}
+
+
+def openapi3(schema):
+    response = {"description": "d"}
+    if schema is not None:
+        response["content"] = {"application/json": {"schema": schema}}
+    return response
+
+
+def swagger2(schema):
+    response = {"description": "d"}
+    if schema is not None:
+        response["schema"] = schema
+    return response
+
+
+@pytest.mark.parametrize("build", [openapi3, swagger2], ids=["openapi3", "swagger2"])
+@pytest.mark.parametrize(
+    ("responses", "expected"),
+    [
+        ([("200", GOOD)], GOOD),
+        ([("200", GOOD), ("default", ERR)], GOOD),
+        ([("default", ERR), ("404", ERR), ("200", GOOD)], GOOD),
+        # a DELETE that answers 204 and documents a default error has no response schema
+        ([("204", None), ("default", ERR)], None),
+        ([("204", None), ("404", ERR)], None),
+        ([("404", ERR)], None),
+        ([("default", ERR)], None),
+        # the first 2xx that has a schema, 200 and 201 ahead of the rest
+        ([("200", None), ("202", OTHER)], OTHER),
+        ([("202", OTHER), ("201", GOOD)], GOOD),
+        ([("201", OTHER), ("200", GOOD)], GOOD),
+        ([("2XX", GOOD)], GOOD),
+        # an empty schema is still a schema ("anything"), not a missing one
+        ([("200", {}), ("202", OTHER)], {}),
+    ],
+)
+def test_response_is_the_success_schema_and_never_an_error_one(build, responses, expected):
+    op = {"responses": {code: build(schema) for code, schema in responses}}
+    spec = {"paths": {"/x": {"delete": op}}}
+    assert operation(spec, "/x", "delete")["response"] == expected
+
+
+def test_an_empty_request_body_schema_is_kept():
+    spec = {
+        "paths": {
+            "/x": {"post": {"requestBody": {"content": {"application/json": {"schema": {}}}}}}
+        }
+    }
+    assert operation(spec, "/x", "post")["requestBody"] == {}
+
+
+def test_null_parts_of_a_yaml_spec_do_not_break_the_summary():
+    spec = {
+        "info": None,
+        "servers": None,
+        "paths": {"/empty": None, "/x": {"get": {"summary": "s"}}},
+    }
+    assert summarize_spec(spec) == {
+        "title": None,
+        "version": None,
+        "servers": [],
+        "operations": [{"method": "GET", "path": "/x", "summary": "s"}],
+    }
+
+
+def test_null_path_items_and_media_types_do_not_break_describe_operation():
+    spec = {
+        "paths": {
+            "/empty": None,
+            "/x": {
+                "post": {
+                    "requestBody": {"content": {"application/json": None}},
+                    "responses": {"200": {"content": {"application/json": None}}},
+                }
+            },
+        }
+    }
+    assert describe_operation(spec, "/empty", None) == {"path": "/empty", "operations": {}}
+    with pytest.raises(KeyError, match="not available"):
+        describe_operation(spec, "/empty", "get")
+    post = operation(spec, "/x", "post")
+    assert post["requestBody"] is None
+    assert post["response"] is None
