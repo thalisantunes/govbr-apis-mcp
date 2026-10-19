@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, date, datetime
 from zoneinfo import ZoneInfo
 
@@ -600,3 +601,97 @@ def test_check_any_returns_the_dne_approval_without_asking_fesn():
 
     d = check_any("ABC", "20000115", "e", "00000000000191", "2026-12-20", fake_call)
     assert d.eligible and d.provider == "dne"
+
+
+# --- a refusal must not hand the card holder's data back to whoever asked ---------
+
+PERSONAL_DATA = ("FULANA DE TAL", "00000000000", "1990-01-01", "example.invalid", "ENGENHARIA")
+DNE_FULL_PAYLOAD = {
+    "status": True,
+    "codigoRetorno": "1",
+    "mensagem": "documento válido",
+    "message": "ok",
+    "nome": "MARIA DA SILVA SANTOS",
+    "cpf": "123.456.789-00",
+    "documento": "MG-11.111.111",
+    "urlFoto": "https://example.invalid/foto.jpg",
+    "dataExpiracao": "20260930",
+}
+
+
+def assert_no_personal_data(decision, extra=()):
+    """Nothing the caller can serialize, log or show may carry the holder's data."""
+    dumped = json.dumps(decision.as_dict(), ensure_ascii=False)
+    for secret in (*PERSONAL_DATA, *extra):
+        assert secret not in dumped, secret
+
+
+def test_fesn_wrong_birth_date_does_not_hand_back_the_real_one():
+    """Guessing a birth date used to return the right one, plus CPF and name, in raw."""
+    d = interpret_fesn(FESN_OK, "1990-01-02", codigo_uso=CODE)
+    assert not d.eligible and d.holder == {} and "não confere" in d.reason
+    assert_no_personal_data(d)
+    assert d.raw == {"validity": "2027-03-31 23:59:59"}
+
+
+def test_fesn_expired_card_keeps_no_personal_data():
+    d = interpret_fesn({**FESN_OK, "validity": "2020-03-31 23:59:59"}, codigo_uso=CODE)
+    assert not d.eligible and "vence em" in d.reason
+    assert_no_personal_data(d)
+
+
+def test_fesn_unreadable_birth_date_keeps_no_personal_data():
+    d = interpret_fesn({**FESN_OK, "birth": "N/A"}, "01/01/1990", codigo_uso=CODE)
+    assert not d.eligible
+    assert_no_personal_data(d)
+
+
+def test_fesn_record_of_another_card_keeps_no_personal_data():
+    d = interpret_fesn(FESN_OK, None, codigo_uso="ZZ99ZZ99")
+    assert not d.eligible and "não encontrada" in d.reason
+    assert_no_personal_data(d)
+
+
+def test_dne_expired_card_keeps_only_non_personal_keys():
+    d = interpret(DNE_FULL_PAYLOAD, data_evento="2026-12-20")
+    assert not d.eligible and "antes da data do evento" in d.reason
+    assert d.raw == {
+        "status": True,
+        "codigoRetorno": "1",
+        "mensagem": "documento válido",
+        "message": "ok",
+        "dataExpiracao": "20260930",
+    }
+    assert_no_personal_data(d, extra=("MARIA DA SILVA", "123.456.789-00", "MG-11.111.111"))
+
+
+def test_dne_unreadable_expiry_keeps_no_personal_data():
+    payload = {k: v for k, v in DNE_FULL_PAYLOAD.items() if k != "dataExpiracao"}
+    d = interpret(payload, data_evento="2026-12-20")
+    assert not d.eligible and "validade não informada/ilegível" in d.reason
+    assert_no_personal_data(d, extra=("MARIA DA SILVA", "123.456.789-00"))
+
+
+def test_dne_refusal_keeps_the_verdict_and_drops_everything_else():
+    payload = {
+        "status": False,
+        "codigoRetorno": "2",
+        "mensagem": "documento inexistente",
+        "nome": "LEAK",
+        "cpf": "999.999.999-99",
+    }
+    d = interpret(payload)
+    assert d.raw == {"status": False, "codigoRetorno": "2", "mensagem": "documento inexistente"}
+
+
+def test_eligible_decisions_keep_the_full_payload():
+    approved = {**DNE_FULL_PAYLOAD, "dataExpiracao": "20270331"}
+    assert interpret(approved, data_evento="2026-12-20").raw == approved
+    assert interpret_fesn(FESN_OK, None, "2026-12-20", codigo_uso=CODE).raw == FESN_OK
+
+
+def test_check_any_combined_decision_keeps_no_personal_data():
+    caller = dne_and_fesn(DNE_NOT_FOUND, reply(FESN_OK))
+    d = check_any("AB12CD34", "1990-01-02", "e", "00000000000191", caller=caller)
+    assert not d.eligible and d.provider is None
+    assert_no_personal_data(d)

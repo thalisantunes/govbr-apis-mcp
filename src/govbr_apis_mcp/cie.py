@@ -43,6 +43,12 @@ RETURN_CODES = {
 }
 
 
+# Keys of a validator payload that carry no personal data. A refusal keeps only these in
+# `raw`: the rest (name, CPF, birth date, photo...) belongs to whoever holds the card, and
+# a caller who merely guessed a code or a birth date must not receive it.
+SAFE_RAW_KEYS = ("status", "codigoRetorno", "mensagem", "message", "dataExpiracao", "validity")
+
+
 class InvalidInput(ValueError):
     """Raised before any network call, so bad input never becomes a confusing 500."""
 
@@ -68,6 +74,13 @@ class CieDecision:
             "holder": self.holder,
             "raw": self.raw,
         }
+
+
+def _refusal(reason: str, payload: dict[str, Any], provider: str | None) -> CieDecision:
+    """A negative decision whose `raw` carries no personal data (see SAFE_RAW_KEYS)."""
+    return CieDecision(
+        False, reason, {}, {k: payload[k] for k in SAFE_RAW_KEYS if k in payload}, provider
+    )
 
 
 def parse_date(value: Any) -> date | None:
@@ -173,13 +186,13 @@ def interpret(payload: dict[str, Any], data_evento: str | None = None) -> CieDec
             parse_date(payload.get("dataExpiracao")), expiry_reference(data_evento)
         )
         if problem:
-            return CieDecision(False, problem, {}, payload, "dne")
+            return _refusal(problem, payload, "dne")
         return CieDecision(True, message or "CIE válida", holder, payload)
 
     reason = RETURN_CODES.get(code or "", message or "CIE não validada")
     if code and code in RETURN_CODES and message and message not in reason:
         reason = f"{reason} ({message})"
-    return CieDecision(False, reason, {}, payload)
+    return _refusal(reason, payload, None)
 
 
 def check(
@@ -296,10 +309,8 @@ def interpret_fesn(
     """
     returned = str(payload.get("useCode") or "").strip().casefold()
     if not returned or returned != codigo_uso.strip().casefold():
-        return CieDecision(
-            False,
+        return _refusal(
             "carteirinha não encontrada na base FESN — a resposta não traz o código consultado",
-            {},
             payload,
             "fesn",
         )
@@ -307,25 +318,21 @@ def interpret_fesn(
     expires = parse_date(payload.get("validity"))
     problem = _expiry_problem(expires, expiry_reference(data_evento))
     if problem:
-        return CieDecision(False, problem, {}, payload, "fesn")
+        return _refusal(problem, payload, "fesn")
 
     if data_nascimento:
         expected = _require_date(data_nascimento, "dataNascimento")
         birth = parse_date(payload.get("birth"))
         if birth is None:
-            return CieDecision(
-                False,
+            return _refusal(
                 "data de nascimento da FESN não informada/ilegível — "
                 "não dá para confirmar a titularidade",
-                {},
                 payload,
                 "fesn",
             )
         if birth != expected:
-            return CieDecision(
-                False,
+            return _refusal(
                 "data de nascimento não confere com a carteirinha — confirme a titularidade",
-                {},
                 payload,
                 "fesn",
             )
