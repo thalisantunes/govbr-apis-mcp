@@ -53,10 +53,15 @@ class CieDecision:
     holder: dict[str, Any] = field(default_factory=dict)
     raw: dict[str, Any] = field(default_factory=dict)
     provider: str | None = None
+    # False when no validator gave an answer (network or HTTP failure, truncated or
+    # unreadable response). That is not a refusal: nothing is known about the card, so
+    # the caller retries or falls back to documents — it never denies on this alone.
+    validated: bool = True
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "eligible": self.eligible,
+            "validated": self.validated,
             "reason": self.reason,
             "provider": self.provider,
             "holder": self.holder,
@@ -194,17 +199,40 @@ def check(
         from .server import call_api as caller  # imported lazily: avoids a cycle
 
     response = caller(API_ID, VALIDATOR_PATH, method="POST", body=body)
-    if "error" in response:
-        return CieDecision(False, f"falha na chamada: {response['error']}", {}, response, "dne")
-
-    payload = response.get("body")
-    if not isinstance(payload, dict):
-        return CieDecision(
-            False, f"resposta inesperada do validador: {payload!r}", {}, response, "dne"
-        )
-    decision = interpret(payload, data_evento)
+    unvalidated = _unvalidated(response, "dne")
+    if unvalidated:
+        return unvalidated
+    decision = interpret(response["body"], data_evento)
     decision.provider = "dne"
     return decision
+
+
+def _unvalidated(response: dict[str, Any], provider: str) -> CieDecision | None:
+    """A "not validated" decision when the gateway response cannot support any verdict.
+
+    The verdict is only read from a complete 2xx JSON object: an error page, a cut body
+    or an unparseable one says nothing about the card. `raw` keeps just the diagnosis,
+    because the text of a truncated body can hold personal data.
+    """
+    body = response.get("body")
+    status = response.get("status")
+    raw = {k: response[k] for k in ("error", "status") if k in response}
+    if isinstance(body, dict):
+        raw.update({k: body[k] for k in ("truncated", "parse_error") if k in body})
+
+    if "error" in response:
+        reason = f"falha na chamada: {response['error']}"
+    elif not (isinstance(status, int) and 200 <= status < 300):
+        reason = f"validador não respondeu com HTTP 2xx (status: {status}), sem decisão"
+    elif isinstance(body, dict) and body.get("truncated"):
+        reason = "resposta truncada/ilegível do validador, sem decisão (acima do limite do gateway)"
+    elif isinstance(body, dict) and body.get("parse_error"):
+        reason = "resposta truncada/ilegível do validador, sem decisão (JSON inválido)"
+    elif not isinstance(body, dict):
+        reason = f"resposta inesperada do validador (corpo {type(body).__name__}), sem decisão"
+    else:
+        return None
+    return CieDecision(False, reason, {}, raw, provider, validated=False)
 
 
 # --- FESN --------------------------------------------------------------------
@@ -307,14 +335,17 @@ def check_fesn(
         from .server import call_api as caller
 
     response = caller(FESN_API_ID, f"{FESN_PATH}/{codigo_uso.strip()}", method="GET")
-    if "error" in response:
-        return CieDecision(False, f"falha na chamada: {response['error']}", {}, response, "fesn")
-    payload = response.get("body")
-    if not isinstance(payload, dict):
+    if response.get("status") == 404:
+        # FESN answers an unknown use code with a 404 and an error object ({"name":
+        # "NotFoundError"...}). That is its verdict on the card, unlike a 5xx; reading the
+        # error object as a student record once approved a card that does not exist.
         return CieDecision(
-            False, f"resposta inesperada do validador: {payload!r}", {}, response, "fesn"
+            False, "carteirinha não encontrada na base FESN", {}, {"status": 404}, "fesn"
         )
-    return interpret_fesn(payload, data_nascimento, data_evento)
+    unvalidated = _unvalidated(response, "fesn")
+    if unvalidated:
+        return unvalidated
+    return interpret_fesn(response["body"], data_nascimento, data_evento)
 
 
 def check_any(
@@ -344,4 +375,5 @@ def check_any(
         f"não validou em nenhuma base consultada (DNE: {dne.reason}; FESN: {fesn.reason}). "
         "Existem emissoras sem API — trate como pendência documental, não como recusa."
     )
+    dne.validated = dne.validated and fesn.validated
     return dne

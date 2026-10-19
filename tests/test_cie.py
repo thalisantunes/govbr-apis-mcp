@@ -9,6 +9,7 @@ from govbr_apis_mcp.cie import (
     build_payload,
     check,
     check_any,
+    check_fesn,
     interpret,
     interpret_fesn,
     normalize_date,
@@ -16,6 +17,11 @@ from govbr_apis_mcp.cie import (
 )
 
 TODAY = date(2026, 10, 19)
+
+
+def reply(body, status=200):
+    """A response shaped like server.call_api's: HTTP status plus the parsed body."""
+    return {"status": status, "url": "https://example.invalid/x", "body": body}
 
 
 @pytest.fixture(autouse=True)
@@ -104,11 +110,12 @@ def test_interpret_falls_back_to_api_message():
 def test_check_surfaces_gateway_error():
     d = check("A", "20000115", "e", "00000000000191", caller=lambda *a, **k: {"error": "sem chave"})
     assert not d.eligible and "sem chave" in d.reason
+    assert not d.validated and d.raw == {"error": "sem chave"}
 
 
 def test_check_handles_non_dict_body():
-    d = check("A", "20000115", "e", "00000000000191", caller=lambda *a, **k: {"body": "<html>"})
-    assert not d.eligible and "inesperada" in d.reason
+    d = check("A", "20000115", "e", "00000000000191", caller=lambda *a, **k: reply("<html>"))
+    assert not d.eligible and not d.validated and "inesperada" in d.reason
 
 
 def test_check_sends_expected_request():
@@ -116,7 +123,7 @@ def test_check_sends_expected_request():
 
     def fake_call(api_id, path, method=None, body=None, **kwargs):
         captured.update(api_id=api_id, path=path, method=method, body=body)
-        return {"body": {"status": True, "nome": "MARIA", "dataExpiracao": "20270331"}}
+        return reply({"status": True, "nome": "MARIA", "dataExpiracao": "20270331"})
 
     d = check("ABC", "2000-01-15", "Show", "00000000000191", "2026-09-07", caller=fake_call)
     assert d.eligible
@@ -166,8 +173,8 @@ def test_check_any_falls_back_to_fesn(monkeypatch):
 
     def fake_call(api_id, path, **kwargs):
         if api_id == "meiaentrada-cie-validador":
-            return {"body": {"status": False, "codigoRetorno": "2"}}
-        return {"body": FESN_OK}
+            return reply({"status": False, "codigoRetorno": "2"})
+        return reply(FESN_OK)
 
     d = check_any("AB12CD34", "1990-01-01", "Show", "00000000000191", caller=fake_call)
     assert d.eligible and d.provider == "fesn"
@@ -179,7 +186,7 @@ def test_check_any_reason_when_all_bases_fail():
         "20000115",
         "e",
         "00000000000191",
-        caller=lambda *a, **k: {"body": {"status": False, "codigoRetorno": "2"}},
+        caller=lambda *a, **k: reply({"status": False, "codigoRetorno": "2"}),
     )
     assert not d.eligible
     assert "pendência documental" in d.reason and "não como recusa" in d.reason
@@ -207,8 +214,8 @@ def test_dne_expiry_enforced_locally():
 def test_check_any_propagates_event_date_to_fesn():
     def fake_call(api_id, path, **kwargs):
         if api_id == "meiaentrada-cie-validador":
-            return {"body": {"status": False, "codigoRetorno": "2"}}
-        return {"body": {**FESN_OK, "validity": "2026-09-30 23:59:59"}}
+            return reply({"status": False, "codigoRetorno": "2"})
+        return reply({**FESN_OK, "validity": "2026-09-30 23:59:59"})
 
     d = check_any("AB12CD34", "1990-01-01", "Show", "00000000000191", "2026-12-20", fake_call)
     assert not d.eligible
@@ -335,3 +342,104 @@ def test_expiry_without_event_date_uses_the_pinned_brazilian_today():
     payload = {"status": True, "nome": "X"}
     assert interpret({**payload, "dataExpiracao": "20261019"}).eligible  # TODAY, last day
     assert not interpret({**payload, "dataExpiracao": "20261018"}).eligible
+
+
+# --- a response must be a complete 2xx before it can carry a verdict -------------
+
+APPROVING_DNE_BODY = {"status": True, "nome": "MARIA", "dataExpiracao": "20270331"}
+
+
+def call_dne(response):
+    return check("A", "20000115", "e", "00000000000191", caller=lambda *a, **k: response)
+
+
+def call_fesn(response, codigo="AB12CD34"):
+    return check_fesn(codigo, caller=lambda *a, **k: response)
+
+
+def test_dne_truncated_response_is_not_validated_and_keeps_the_cause():
+    """call_api cuts bodies above 60k chars; that used to come out as a bare "não validada"."""
+    body = {"text": "x" * 50, "truncated": True, "hint": "narrow it"}
+    d = call_dne(reply(body))
+    assert not d.eligible and not d.validated
+    assert "truncada/ilegível" in d.reason and "sem decisão" in d.reason
+    assert d.raw == {"status": 200, "truncated": True}  # the cut body may hold personal data
+
+
+def test_dne_unparseable_json_is_not_validated_and_keeps_the_cause():
+    body = {"text": "<html>", "parse_error": "content-type said JSON but body did not parse"}
+    d = call_dne(reply(body))
+    assert not d.eligible and not d.validated
+    assert "truncada/ilegível" in d.reason and "JSON inválido" in d.reason
+    assert d.raw == {"status": 200, "parse_error": body["parse_error"]}
+
+
+@pytest.mark.parametrize("status", [301, 401, 404, 429, 500, 503])
+def test_dne_non_2xx_is_not_validated_even_with_an_approving_body(status):
+    d = call_dne(reply(APPROVING_DNE_BODY, status))
+    assert not d.eligible and not d.validated
+    assert f"status: {status}" in d.reason and d.holder == {}
+
+
+def test_dne_response_without_http_status_is_not_validated():
+    d = call_dne({"body": APPROVING_DNE_BODY})
+    assert not d.eligible and not d.validated and "status: None" in d.reason
+
+
+def test_dne_refusal_by_the_validator_is_a_verdict_not_a_failure():
+    d = call_dne(reply({"status": False, "codigoRetorno": "2"}))
+    assert not d.eligible and d.validated
+
+
+def test_decision_exposes_validated_in_as_dict():
+    assert call_dne(reply(APPROVING_DNE_BODY)).as_dict()["validated"] is True
+    assert call_dne({"error": "x"}).as_dict()["validated"] is False
+
+
+def test_fesn_404_with_a_misleading_body_is_not_found_not_approval():
+    """FESN answers an unknown code with a 404 error object: `name` is the error class."""
+    d = call_fesn(reply({"name": "NotFoundError", "message": "no such code"}, 404))
+    assert not d.eligible and d.validated and "não encontrada" in d.reason
+    assert d.raw == {"status": 404} and d.holder == {}
+
+
+@pytest.mark.parametrize("status", [301, 401, 403, 429, 500, 502, 503])
+def test_fesn_non_2xx_is_not_validated_even_with_a_perfect_body(status):
+    d = call_fesn(reply(FESN_OK, status))
+    assert not d.eligible and not d.validated and f"status: {status}" in d.reason
+
+
+def test_fesn_response_without_http_status_is_not_validated():
+    d = call_fesn({"body": FESN_OK})
+    assert not d.eligible and not d.validated
+
+
+def test_fesn_truncated_response_is_not_validated():
+    d = call_fesn(reply({"text": "x", "truncated": True}))
+    assert not d.eligible and not d.validated and "truncada/ilegível" in d.reason
+    assert d.raw == {"status": 200, "truncated": True}
+
+
+def test_fesn_unparseable_json_is_not_validated():
+    d = call_fesn(reply({"text": "<html>", "parse_error": "bad json"}))
+    assert not d.eligible and not d.validated and "truncada/ilegível" in d.reason
+
+
+def test_fesn_non_dict_body_is_not_validated():
+    d = call_fesn(reply("<html>"))
+    assert not d.eligible and not d.validated and "inesperada" in d.reason
+
+
+def test_fesn_gateway_error_is_not_validated():
+    d = call_fesn({"error": "ConnectError: boom"})
+    assert not d.eligible and not d.validated and "boom" in d.reason
+
+
+def test_check_any_still_approves_via_fesn_when_dne_is_unreachable():
+    def fake_call(api_id, path, **kwargs):
+        if api_id == "meiaentrada-cie-validador":
+            return {"error": "MEIAENTRADA_CODIGO_ACESSO não definido"}
+        return reply(FESN_OK)
+
+    d = check_any("AB12CD34", "1990-01-01", "Show", "00000000000191", caller=fake_call)
+    assert d.eligible and d.validated and d.provider == "fesn"
