@@ -331,6 +331,14 @@ HOST_CASES = [
     ("https://sub.brasilapi.com.br/x", False),
     # a trailing dot (rooted FQDN) is refused: conservative, and nothing in the catalog needs it
     ("https://sub.gov.br./x", False),
+    # a hostname is plain ASCII letters, digits, dots and hyphens: junk before an allowed
+    # suffix is no subdomain, whatever a resolver would make of it
+    ("https://evil.com;.gov.br/x", False),
+    ("https://evil.com%2f.gov.br/x", False),
+    ("https://evil.com\\.gov.br/x", False),
+    # malformed URLs fail closed instead of raising
+    ("https://[::1/x", False),
+    ("https://::1]/x", False),
     # not URLs with a host at all
     ("sub.gov.br/x", False),
     ("https:///x", False),

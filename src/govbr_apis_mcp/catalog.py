@@ -48,6 +48,9 @@ ALLOWED_HOSTS = {
     "validade.fesn.org.br",
 }
 URL_FIELDS = ("base_url", "openapi_url", "docs_url")
+# Plain ASCII hostnames only (IDN hosts in punycode). Anything else, such as
+# "evil.com;.gov.br", is no subdomain of what it ends with, whatever a resolver makes of it.
+HOSTNAME_RE = re.compile(r"[a-z0-9.-]+")
 
 
 def extra_allowed_hosts() -> set[str]:
@@ -57,8 +60,11 @@ def extra_allowed_hosts() -> set[str]:
 
 
 def host_allowed(url: str) -> bool:
-    host = (urlsplit(url).hostname or "").lower()
-    if not host:
+    try:
+        host = (urlsplit(url).hostname or "").lower()
+    except ValueError:  # malformed URL, e.g. an unclosed IPv6 bracket: fail closed
+        return False
+    if not HOSTNAME_RE.fullmatch(host):
         return False
     if host in ALLOWED_HOSTS or host in extra_allowed_hosts():
         return True
