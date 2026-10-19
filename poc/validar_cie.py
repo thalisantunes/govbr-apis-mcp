@@ -115,7 +115,9 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="base a consultar; auto tenta todas antes de negar (padrão)",
     )
-    parser.add_argument("--demo", action="store_true", help="roda com respostas gravadas, sem rede")
+    parser.add_argument(
+        "--demo", action="store_true", help="roda com respostas de exemplo, sem rede"
+    )
     parser.add_argument("--json", action="store_true", help="saída em JSON")
     return parser
 

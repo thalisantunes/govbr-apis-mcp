@@ -202,16 +202,20 @@ def test_check_any_propagates_event_date_to_fesn():
 
 
 # --- "today" is the Brazilian civil date, and injectable ------------------------
+# June instants on purpose: Brazil does not observe summer time in June (southern winter), so
+# the expected dates do not depend on what tzdata says about December.
+
+LATE_EVENING_BRT = datetime(2026, 6, 21, 2, 30, tzinfo=UTC)  # 23:30 on 2026-06-20 in Brasília
 
 
 @pytest.mark.parametrize(
     "now,expected",
     [
         # 23:30 in Brasília is already tomorrow in UTC
-        (datetime(2026, 12, 21, 2, 30, tzinfo=UTC), date(2026, 12, 20)),
-        (datetime(2026, 12, 20, 23, 30, tzinfo=ZoneInfo("America/Sao_Paulo")), date(2026, 12, 20)),
-        (datetime(2026, 12, 21, 2, 59, tzinfo=UTC), date(2026, 12, 20)),
-        (datetime(2026, 12, 21, 3, 0, tzinfo=UTC), date(2026, 12, 21)),  # midnight in Brasília
+        (LATE_EVENING_BRT, date(2026, 6, 20)),
+        (datetime(2026, 6, 20, 23, 30, tzinfo=ZoneInfo("America/Sao_Paulo")), date(2026, 6, 20)),
+        (datetime(2026, 6, 21, 2, 59, tzinfo=UTC), date(2026, 6, 20)),
+        (datetime(2026, 6, 21, 3, 0, tzinfo=UTC), date(2026, 6, 21)),  # midnight in Brasília
     ],
 )
 def test_today_br_is_the_brazilian_date_not_utc(now, expected):
@@ -219,20 +223,18 @@ def test_today_br_is_the_brazilian_date_not_utc(now, expected):
 
 
 def test_default_event_date_is_the_brazilian_today(monkeypatch):
-    late_evening = datetime(2026, 12, 21, 2, 30, tzinfo=UTC)  # 23:30 in Brasília
-    monkeypatch.setattr(cie, "today_br", lambda: today_br(late_evening))
+    monkeypatch.setattr(cie, "today_br", lambda: today_br(LATE_EVENING_BRT))
     body = build_payload("ABC", "20000115", "x", "00000000000191")
-    assert body["dataEvento"] == "20261220"  # UTC would have sent 20261221
+    assert body["dataEvento"] == "20260620"  # UTC would have sent 20260621
 
 
 def test_card_is_still_valid_on_its_last_day_late_in_the_evening(monkeypatch):
-    """After 21:00 in Brasília the UTC date is already tomorrow and refused the card."""
-    late_evening = datetime(2026, 12, 21, 2, 30, tzinfo=UTC)
-    monkeypatch.setattr(cie, "today_br", lambda: today_br(late_evening))
+    """From 21:00 in Brasília the UTC date is already tomorrow; the card must still count."""
+    monkeypatch.setattr(cie, "today_br", lambda: today_br(LATE_EVENING_BRT))
     assert interpret_fesn(
-        {**FESN_OK, "validity": "2026-12-20 23:59:59"}, None, codigo_uso=CODE
+        {**FESN_OK, "validity": "2026-06-20 23:59:59"}, None, codigo_uso=CODE
     ).eligible
-    assert interpret({"status": True, "nome": "X", "dataExpiracao": "2026-12-20"}).eligible
+    assert interpret({"status": True, "nome": "X", "dataExpiracao": "2026-06-20"}).eligible
 
 
 # --- dates: one parser, a real calendar, compared as dates ------------------------
@@ -394,7 +396,8 @@ def test_decision_exposes_validated_in_as_dict():
 
 
 def test_fesn_404_with_a_misleading_body_is_not_found_not_approval():
-    """FESN answers an unknown code with a 404 error object: `name` is the error class."""
+    """An unknown code is expected to come back as a 404 error object (a premise, see docs):
+    `name` is the error class, not a holder."""
     d = call_fesn(reply({"name": "NotFoundError", "message": "no such code"}, 404))
     assert not d.eligible and d.validated and "não encontrada" in d.reason
     assert d.raw == {"status": 404} and d.holder == {}

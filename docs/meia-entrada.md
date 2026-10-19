@@ -40,6 +40,16 @@ documental, não de recusa automática.
 
 ### Regras de decisão (`src/govbr_apis_mcp/cie.py`)
 
+Há dois resultados negativos, e a diferença entre eles é o núcleo do desenho:
+
+- **Recusa** (`validated=true`, exit 1 na POC): um validador respondeu e a carteirinha não
+  vale. É um veredito sobre a carteirinha.
+- **Não validado** (`validated=false`, exit 3): faltou resposta utilizável para decidir, então
+  nada se sabe sobre a carteirinha.
+
+Nenhum dos dois é recusa do direito. A regra de produto "não validou nunca é recusa" vale para
+os dois: o fluxo trata ambos como pendência documental (no exit 3, depois de tentar de novo).
+
 - **Datas.** A entrada e as respostas (`dataExpiracao` do DNE, `validity` da FESN) passam
   por um único leitor, que aceita `YYYY-MM-DD` (opcionalmente seguido de `T` ou espaço e um
   horário válido, `HH:MM[:SS[.fff]]` com `Z` ou fuso opcional, que não é aplicado),
@@ -48,30 +58,49 @@ documental, não de recusa automática.
   `20260930` ordena depois de `2026-12-20`.
 - **Validade.** É conferida contra a data do evento, não a da compra, e vale até o fim do
   dia do vencimento. Sem data do evento, usa o dia de hoje em America/Sao_Paulo (depois das
-  21h em Brasília a data em UTC já é a do dia seguinte).
+  21h em Brasília a data em UTC já é a do dia seguinte). O relógio é lido uma única vez por
+  consulta, antes de qualquer chamada de rede, e o mesmo dia vale para o DNE, para a FESN e
+  para a comparação da validade.
 - **Fail closed.** O que a decisão exige e não veio, ou não dá para ler, nunca aprova:
   validade ausente ou ilegível; na FESN, resposta com `useCode` diferente do consultado ou
   data de nascimento informada que ela não devolveu; HTTP fora de 2xx; resposta truncada
   ou com JSON inválido.
-- **Não validado não é recusa.** Quando faltou resposta utilizável para decidir (erro de
-  rede ou do gateway, HTTP fora de 2xx, resposta truncada, ilegível ou sem veredito), a
-  decisão sai com `validated=false` e a POC com exit 3: o fluxo tenta de novo ou pede
-  comprovação documental, nunca nega só por isso. "Sem veredito" é o DNE sem `status`
-  booleano nem `codigoRetorno`, o DNE com `codigoRetorno` 5 (erro do nosso pedido, não da
-  carteirinha) e a FESN com 200 sem o `useCode` consultado. A exceção é o 404 da FESN com o
-  objeto de erro esperado (`name: "NotFoundError"`), lido como "não encontrada"; um 404 com
-  outro corpo é "não validado". Na consulta combinada só é "não elegível" se todas as bases
-  deram um veredito; com uma delas fora do ar ou sem resposta utilizável o resultado é
-  "não validado".
-- **Entrada.** Código de uso, data de nascimento e data do evento são validados antes de
-  qualquer chamada de rede, inclusive em `auto`, para que entrada inválida nunca descarte um
-  veredito já obtido. Na FESN o código vai no path da URL, então só aceita 1 a 64 caracteres
-  entre letras, dígitos, `.`, `_` e `-` (e não apenas pontos). Uma data de nascimento
-  informada e vazia é erro, não uma checagem pulada.
+- **Códigos do DNE.** A API responde 200 até quando falha, então só os códigos conhecidos
+  são veredito. `1` com `status` verdadeiro aprova (se a validade cobrir o evento); `2`
+  (documento não encontrado) é a única recusa conhecida; `5` é erro do nosso pedido e
+  qualquer outro código é resposta não reconhecida, os dois como "não validado". Sem código,
+  só um `status` falso explícito é recusa. `status` verdadeiro com código diferente de `1`,
+  ou código `1` sem `status` verdadeiro, se contradiz e também é "não validado".
+- **O que é "não validado".** Erro de rede ou do gateway, HTTP fora de 2xx, resposta
+  truncada, ilegível ou sem veredito (DNE sem `status` booleano nem `codigoRetorno`; FESN com
+  200 sem o `useCode` consultado), código do DNE desconhecido ou contraditório e, na POC,
+  qualquer exceção inesperada, inclusive ao imprimir. A exceção é o 404 da FESN com o objeto
+  de erro esperado (`name: "NotFoundError"`), lido como "não encontrada" (recusa); um 404 com
+  outro corpo é "não validado". Na consulta combinada só é recusa se todas as bases
+  consultadas deram veredito; com uma delas fora do ar ou sem resposta utilizável o resultado
+  é "não validado".
+- **Premissas sobre a FESN, a confirmar.** Duas leituras não vêm de uma resposta gravada
+  neste repositório: (1) um código desconhecido volta como 404 com o objeto
+  `{"name": "NotFoundError"}`; (2) uma carteirinha existente volta com o `useCode` consultado
+  no corpo (a descrição do catálogo não lista esse campo). Ambas derivam de comportamento da
+  FESN observado e relatado durante o desenvolvimento, e só viram fato com uma consulta real,
+  com um código existente e um inexistente, registrando status, content-type e corpo sem dado
+  pessoal. Se divergirem, o efeito é conservador: o que a FESN responder fora desse formato
+  vira "não validado" (exit 3), nunca aprovação.
+- **Entrada.** O que toda base precisa (código de uso, datas, CNPJ) é validado antes de
+  qualquer chamada de rede. Uma data de nascimento ou do evento informada e vazia é erro
+  (`InvalidInput`), não uma checagem pulada nem "hoje"; só `None` pede o padrão. O formato do
+  código de uso (1 a 64 caracteres entre letras, dígitos, `.`, `_` e `-`, e não apenas pontos)
+  é exigência da FESN, porque o código vai no path da URL: com `--provedor fesn` um código
+  fora do formato é erro (exit 2); em `auto` ele pula a FESN ("não consultada: o código não é
+  um useCode FESN") e vale o veredito do DNE. O DNE recebe o código no corpo JSON e aceita
+  qualquer texto não vazio.
 - **Dado pessoal.** Numa decisão não elegível, `holder` fica vazio e `raw` só leva chaves
   não pessoais: `status`, `codigoRetorno`, `mensagem`/`message`, a validade e, quando nenhum
-  validador respondeu, o diagnóstico do gateway. Nome, CPF, nascimento e foto só aparecem
-  quando a carteirinha é aprovada.
+  validador respondeu, o diagnóstico do gateway. `mensagem` e `message` são texto livre do
+  emissor e podem carregar dado pessoal: só entram em `raw` (e a `mensagem`, na razão) se
+  forem texto, e cortadas em 200 caracteres. Nome, CPF, nascimento e foto só aparecem quando a carteirinha é
+  aprovada.
 
 ## ID Jovem
 
