@@ -1,4 +1,3 @@
-
 import pytest
 
 from govbr_apis_mcp import auth
@@ -79,9 +78,7 @@ SPEC = {
                 "responses": {
                     "200": {
                         "content": {
-                            "application/json": {
-                                "schema": {"$ref": "#/components/schemas/Thing"}
-                            }
+                            "application/json": {"schema": {"$ref": "#/components/schemas/Thing"}}
                         }
                     }
                 },
@@ -89,9 +86,7 @@ SPEC = {
         }
     },
     "components": {
-        "schemas": {
-            "Thing": {"type": "object", "properties": {"name": {"type": "string"}}}
-        }
+        "schemas": {"Thing": {"type": "object", "properties": {"name": {"type": "string"}}}}
     },
 }
 

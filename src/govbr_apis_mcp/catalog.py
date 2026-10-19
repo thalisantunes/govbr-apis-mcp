@@ -121,7 +121,9 @@ class ApiEntry:
 
         token_url = self.auth_config.get("token_url")
         if token_url and (not token_url.startswith("https://") or not host_allowed(token_url)):
-            raise ValueError(f"{where}: auth_config.token_url not https/allowlisted ({token_url!r})")
+            raise ValueError(
+                f"{where}: auth_config.token_url not https/allowlisted ({token_url!r})"
+            )
         if self.auth == "api_key" and not self.auth_config.get("header"):
             raise ValueError(f"{where}: auth=api_key requires auth_config.header")
         if self.auth == "oauth2_client_credentials" and self.callable and not token_url:
