@@ -6,16 +6,20 @@
 
 MCP server that turns Brazilian government APIs into Claude-callable tools through a
 **spec-driven gateway**: instead of one tool per endpoint (hundreds — would blow up
-client context), five generic tools operate over a local YAML catalog and load each
-API's OpenAPI spec on demand.
+client context), five generic tools operate over a local YAML catalog of 116 APIs.
+
+"Spec-driven" holds for the entries that declare an `openapi_url`: today the Câmara dos
+Deputados and the Portal da Transparência, 2 of the 116. For those, `describe_api` loads
+the OpenAPI spec on demand. Every other entry is reachable through `call_api` alone, using
+the endpoints in its description and `docs_url`.
 
 ## Catalog tiers
 
 | Tier | File | Access model | Callable today? |
 |------|------|--------------|-----------------|
 | `public` | `src/govbr_apis_mcp/catalog_data/public.yaml` | Free — no auth or free API key (IBGE, Banco Central, Câmara, Senado, Portal da Transparência, DataJud, Ipeadata, dados.gov.br…) | Yes |
-| `serpro` | `src/govbr_apis_mcp/catalog_data/serpro.yaml` | Serpro commercial (loja.serpro.gov.br) — OAuth2 client credentials per contracted API, paid per call | With a Serpro contract |
-| `meia-entrada` | `src/govbr_apis_mcp/catalog_data/meia_entrada.yaml` | Eligibility sources for half-price tickets (student CIE, ID Jovem, PcD, e-MEC) — see [docs/meia-entrada.md](docs/meia-entrada.md) | CIE yes; the rest is manual |
+| `serpro` | `src/govbr_apis_mcp/catalog_data/serpro.yaml` | Serpro commercial (loja.serpro.gov.br) — OAuth2 client credentials per contracted API, paid per call | With a Serpro contract: set the `SERPRO_*` variables |
+| `meia-entrada` | `src/govbr_apis_mcp/catalog_data/meia_entrada.yaml` | Eligibility sources for half-price tickets (student CIE, ID Jovem, PcD, e-MEC) — see [docs/meia-entrada.md](docs/meia-entrada.md) and the [POC](poc/README.md) | CIE yes (DNE and FESN); the rest is manual |
 | `conecta` | `src/govbr_apis_mcp/catalog_data/conecta.yaml` | [Conecta gov.br](https://www.gov.br/conecta/catalogo/) — **restricted to public-sector entities**; 95 APIs indexed as stubs for discovery | Not yet (adhesion pending) |
 
 The Conecta tier exists so the catalog reflects the whole landscape now, and becomes
@@ -26,15 +30,30 @@ flow is already implemented (Serpro uses the same one).
 
 - `search_catalog(query, category?)` — accent-insensitive keyword search; reports total
   matches and whether the list was truncated.
-- `list_apis(category?, status?, limit?)` — enumerate entries (filter it: ~95 Conecta stubs
-  otherwise dominate the output).
+- `list_apis(category?, status?, limit?)` — enumerate entries, callable ones first (filter
+  it: ~95 Conecta stubs otherwise dominate the output).
 - `describe_api(api_id, path?, method?)` — catalog metadata + OpenAPI operation list;
-  with `path`, parameter/request/response schemas ($refs inlined, depth-limited).
+  with `path`, parameter/request/response schemas ($refs inlined, depth-limited). Reads
+  OpenAPI 3 and Swagger 2.0, as JSON or YAML.
 - `call_api(api_id, path, method?, query?, body?, headers?)` — invoke an endpoint; base URL
-  and auth resolved from the catalog entry. A query string embedded in `path` is merged with
-  `query` (httpx would otherwise drop it), `..` is rejected, and caller headers cannot
-  override the managed `Authorization`/`Host`.
-- `credentials_status(api_id?)` — which env vars each API needs and whether they're set.
+  and auth resolved from the catalog entry.
+  - `method` is GET, HEAD, POST, PUT, PATCH, DELETE or OPTIONS; anything else returns an
+    error with `allowed_methods`.
+  - `path` is relative to the `base_url`. `.` and `..` segments (after up to three rounds of
+    percent-decoding, with `\` read as `/` and `;` parameters removed) and any path that
+    leaves the `base_url` prefix are rejected.
+  - A query string embedded in `path` is merged with `query`; a key in `query` replaces the
+    embedded one, and a list value repeats the key.
+  - Caller headers are matched case-insensitively, with `_` equal to `-`. Connection, proxy,
+    forwarding and method-override headers (the list is in `server.py`) are dropped and
+    reported in `ignored_headers`. The managed credential is applied last and always wins.
+  - Method, body, headers and path are validated before any OAuth2 token is requested, and
+    invalid input comes back as `{"error": ...}`.
+  - A `3xx` is not followed: the response carries its `location` (redacted, resolved
+    against the requested URL). Response bodies are cut at 60,000 characters.
+- `credentials_status(api_id?)` — which env vars each API needs and whether they're set,
+  plus `callable`: whether `call_api` would accept the entry right now (`available` and
+  `unstable` entries; `requires_contract` ones only once their env vars are set).
 
 ## POC: meia-entrada de estudante
 
@@ -65,11 +84,29 @@ Register in Claude Code (`.mcp.json` or `claude mcp add`):
 }
 ```
 
+Once published on PyPI: `uvx govbr-apis-mcp` (set `"command": "uvx"` and
+`"args": ["govbr-apis-mcp"]` in the entry above; no checkout needed).
+
+Or run it in a container. The server speaks stdio, so keep `-i`:
+
+```bash
+docker build -t govbr-apis-mcp . && docker run -i --rm -e TRANSPARENCIA_API_KEY=... govbr-apis-mcp
+```
+
 ## Credentials
 
 All secrets come from env vars declared per entry in the catalog (`auth_config`).
-Nothing is stored in the repo. See `.env.example` for the full list; each entry's
+Nothing is stored in the repo. `.env.example` lists the variables; each entry's
 `signup_url` says where to get a key. `credentials_status` reports readiness.
+
+The server does not read `.env` files. Put the variables in the MCP client's `env` block
+(as in the example above), pass them to a container with `docker run --env-file`, or
+export them in the shell that launches the client (`direnv` works well for that).
+
+Values are stripped of surrounding whitespace and must be printable ASCII; otherwise the
+call fails with `credential in <VAR> contains invalid characters`, without echoing the
+value. When the OAuth2 token endpoint fails, the call returns an `error` and the
+`token_url`, with neither the response body nor any secret.
 
 Auth profiles: `none`, `api_key` (static header, optional value prefix — e.g.
 DataJud's `APIKey <key>`), `oauth2_client_credentials` (token endpoint + id/secret,
@@ -77,20 +114,25 @@ in-memory token cache; used by Serpro today, by Conecta after adhesion).
 
 ## Extending the catalog
 
-Add an entry to a YAML file in `src/govbr_apis_mcp/catalog_data/`. Minimum fields:
+Add an entry to a YAML file in `src/govbr_apis_mcp/catalog_data/`. The directory is package
+data, so the wheel, `uvx` and the Docker image all carry the catalog. Minimum fields:
 `id`, `name`, `provider`, `category`, `status`, `auth`. Add `openapi_url` when the API
 publishes a spec — `describe_api` then works with zero code. Regenerate the Conecta
-tier with `python scripts/scrape_conecta.py`.
+tier with `.venv/bin/python scripts/scrape_conecta.py` (it leaves the file alone when the
+page yields no APIs or an id the catalog would reject).
 
 Entries are validated on load: ids must be filename-safe, URLs must be `https` on an
-allowlisted host (`*.gov.br`, `*.leg.br`, `*.jus.br` plus a few named hosts). This is a
+allowlisted host (`*.gov.br`, `*.leg.br`, `*.jus.br` plus a few named hosts), and a hostname
+may only contain `[a-z0-9.-]` (write internationalized names in punycode). This is a
 security boundary, not style — the catalog decides where your credentials are sent. Add a
-host with `GOVBR_EXTRA_ALLOWED_HOSTS` only if you trust it with them.
+host with `GOVBR_EXTRA_ALLOWED_HOSTS` only if you trust it with them; the same hostname
+rule applies to it.
 
 To override entries without forking (e.g. filling in Conecta base URLs after adhesion),
-point `GOVBR_EXTRA_CATALOG_DIR` at a directory whose same-id entries win.
-`GOVBR_CATALOG_DIR` replaces the base catalog entirely and should be treated as trusted
-input.
+point `GOVBR_EXTRA_CATALOG_DIR` at a directory of `.yaml` or `.yml` files whose same-id
+entries win. A directory that does not exist or holds no entries is an error, and so is an
+id repeated inside it; an empty value counts as unset. `GOVBR_CATALOG_DIR` replaces the
+base catalog entirely and should be treated as trusted input.
 
 ## Development
 
@@ -107,19 +149,30 @@ loads the catalog from a clean install.
 
 ## Security notes
 
-- Responses are never written to disk; only OpenAPI specs are cached (file names are
-  hashes of the api id) and OAuth2 tokens live in memory only.
+- Responses are never written to disk. Only OpenAPI specs are cached, in
+  `$XDG_CACHE_HOME/govbr-apis-mcp/` (or `~/.cache/govbr-apis-mcp/`) for 24 hours, under a
+  file name derived from `sha256(api_id + "\n" + openapi_url)`: never the id itself, and a
+  changed `openapi_url` never serves the old spec. OAuth2 tokens live in memory only.
 - `call_api` does not follow redirects — credentialed requests cannot be steered to
-  another host by a `3xx`. Spec fetches follow redirects but re-check the allowlist.
+  another host by a `3xx`; the response carries the (redacted) `location` instead. It always
+  sends `Accept-Encoding: identity`, so the 60,000-character cut is made on the streamed body.
+- Spec fetches follow redirects only by hand: at most 5 hops, and every URL (the first
+  and each `Location`) must be `https` on an allowlisted host before it is requested.
+  The body is capped at 5 MiB, JSON and YAML are accepted (YAML with anchors, aliases or
+  merge keys is refused), and the document must carry `openapi` or `swagger`.
+- `httpx` and `httpcore` log at WARNING, so no URL with a query string reaches stderr.
 - Entries flagged `pii: true` return personal data (CPF, name, photo) into the client
-  transcript. Today: `meiaentrada-cie-validador` and the Serpro tier.
+  transcript. Today: `meiaentrada-cie-validador`, `fesn-cie-validador` (callable without
+  any credential: whoever holds a use code gets the holder's data) and the three Serpro
+  entries.
 
 ## Roadmap
 
 - [ ] Conecta adhesion as a public-sector entity → fill gateway base URLs + credentials
 - [ ] Per-API OpenAPI URLs for Conecta entries (linked from each detail page)
 - [ ] Serpro trial-mode toggle (call `-trial` base URLs with the published demo token)
-- [ ] Rate-limit guard for paid (per-call) Serpro APIs
+- [ ] Per-call cost guard for paid Serpro APIs
+- [ ] Bounded decompression for compressed upstream responses
 - [ ] Pleito à SNJ para a API `conecta-id-jovem` (admite instituição privada)
 - [ ] Fallback documental para CIE fora da base DNE (DCEs e entidades estaduais)
 
