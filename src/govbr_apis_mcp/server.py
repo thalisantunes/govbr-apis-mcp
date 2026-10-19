@@ -228,11 +228,11 @@ def call_api(
     if not _callable_now(entry):
         hint = entry.notes or entry.docs_url
         if entry.status == "requires_contract" and entry.base_url is not None:
-            env_vars = auth_module.credentials_status(entry)["env_vars"]
-            missing = [var for var, is_set in env_vars.items() if not is_set]
-            if missing:
-                setup = f"Set {', '.join(missing)} to use your contract credentials."
-                hint = " ".join(filter(None, [setup, hint]))
+            creds = auth_module.credentials_status(entry)
+            missing = [var for var, is_set in creds["env_vars"].items() if not is_set]
+            setup = f"Set {', '.join(missing)} to use your contract credentials." if missing else ""
+            reason = f"{creds['reason']}." if "reason" in creds else ""
+            hint = " ".join(filter(None, [reason, setup, hint]))
         return {
             "error": f"{entry.id} is not callable (status: {entry.status}).",
             "hint": hint,
@@ -246,7 +246,7 @@ def call_api(
             "error": f"method {method!r} is not allowed.",
             "allowed_methods": list(ALLOWED_METHODS),
         }
-    if body is not None and method in ("GET", "HEAD", "DELETE"):
+    if body is not None and method in ("GET", "HEAD", "DELETE", "OPTIONS"):
         return {
             "error": f"body is not supported with {method}; "
             "use query for parameters, or POST if the API expects a payload."
@@ -275,7 +275,7 @@ def call_api(
         return {"error": f"{type(exc).__name__}: {message}", "url": url}
     except httpx.HTTPError as exc:
         return {"error": f"{type(exc).__name__}: {exc}", "url": url}
-    except (httpx.InvalidURL, UnicodeError):
+    except (httpx.InvalidURL, ValueError):  # UnicodeError is a ValueError too
         # httpx builds the request a 3xx points to even though it is told not to follow it
         return {"error": "upstream sent a malformed Location header", "url": url}
 
@@ -374,12 +374,9 @@ def _decoded(path: str) -> str | None:
     return None
 
 
-def _has_dot_segment(path: str) -> bool:
-    """True if `path` has a '.' or '..' segment however a chain of proxies and servers
-    might read it: percent-decoded repeatedly, '\\' taken as '/', ';params' dropped."""
-    decoded = _decoded(path)
-    if decoded is None:  # undecidable: refuse it
-        return True
+def _has_dot_segment(decoded: str) -> bool:
+    """True if the percent-decoded path has a '.' or '..' segment however a chain of proxies
+    and servers might read it: '\\' taken as '/', ';params' dropped from each segment."""
     return any(
         segment.split(";", 1)[0] in (".", "..") for segment in decoded.replace("\\", "/").split("/")
     )
@@ -405,9 +402,11 @@ def _build_target(
             "Percent-encode it as %23 if it is meant literally."
         )
     decoded = _decoded(raw_path)
-    if decoded is not None and any(ord(char) < 0x20 or ord(char) == 0x7F for char in decoded):
+    if decoded is None:
+        raise ValueError(f"path {path!r} stays percent-encoded after 3 decodings.")
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in decoded):
         raise ValueError(f"path {path!r} contains control characters.")
-    if _has_dot_segment(raw_path):
+    if _has_dot_segment(decoded):
         raise ValueError(
             f"path {path!r} contains '..' or '.' segments — "
             "pass a path relative to the API's base URL."
@@ -449,11 +448,17 @@ def _send(
     with _client.stream(method, url, params=params, json=body, headers=headers) as resp:
         chunks: list[str] = []
         size = 0
-        for chunk in resp.iter_text():
-            chunks.append(chunk)
-            size += len(chunk)
-            if size > MAX_BODY_CHARS:
-                break
+        try:
+            for chunk in resp.iter_text():
+                chunks.append(chunk)
+                size += len(chunk)
+                if size > MAX_BODY_CHARS:
+                    break
+        except (LookupError, AssertionError, TypeError, UnicodeError):
+            # httpx takes any registered codec as a charset (hex, zlib, rot13) and then fails
+            charset = (resp.charset_encoding or "")[:40]
+            message = f"upstream response could not be decoded (charset={charset})"
+            return {"error": message, "status": resp.status_code}
         text = "".join(chunks)
         content_type = resp.headers.get("content-type")
         request_url = str(resp.request.url)
@@ -484,7 +489,7 @@ def _send(
     if location and 300 <= resp.status_code < 400:
         try:
             result["location"] = _redact(str(resp.url.join(location)))
-        except httpx.InvalidURL:  # httpx only vets Location on 301/302/303/307/308
+        except (httpx.InvalidURL, ValueError):  # httpx only vets Location on 301/302/303/307/308
             result["location"] = "<invalid URL>"
     return result
 

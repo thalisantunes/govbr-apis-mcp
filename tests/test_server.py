@@ -116,8 +116,18 @@ def test_path_only_query_survives_without_dict():
 )
 def test_traversal_is_rejected(path):
     """A proxy in front of the API may decode more than once, so decode until stable."""
-    with pytest.raises(ValueError, match="escapes the API's base URL|contains '\\.\\.'"):
+    with pytest.raises(
+        ValueError,
+        match=(
+            "escapes the API's base URL|contains '\\.\\.'|stays percent-encoded after 3 decodings"
+        ),
+    ):
         server._build_target(BASE, path, None)
+
+
+def test_a_path_that_stays_encoded_after_three_decodings_says_so():
+    with pytest.raises(ValueError, match="stays percent-encoded after 3 decodings"):
+        server._build_target(BASE, "/%2525252e%2525252e/x", None)
 
 
 @pytest.mark.parametrize(
@@ -253,7 +263,23 @@ def test_malformed_redirect_location_is_an_error(status, location, catalog, wire
     }
 
 
-@pytest.mark.parametrize("location", [b"http://[::1", b"https://x.gov.br:abc/"])
+@pytest.mark.parametrize("status", [300, 301, 302, 308])
+@pytest.mark.parametrize("location", [b"https:////[", b"http:////[::1", b":s://["])
+def test_location_that_makes_urllib_raise_is_handled(status, location, catalog, wire):
+    """urllib refuses some Locations httpx lets through, with a plain ValueError. Which of the
+    two places that join the Location notices it depends on the status and the value."""
+    wire(lambda request: httpx.Response(status, headers=[(b"location", location)]))
+    out = server.call_api("ibge-localidades", "/estados")
+    assert (
+        out.get("error") == "upstream sent a malformed Location header"
+        or out.get("location") == "<invalid URL>"
+    )
+
+
+@pytest.mark.parametrize(
+    "location",
+    [b"http://[::1", b"https://x.gov.br:abc/", b"https:////[", b"http:////[::1", b":s://["],
+)
 def test_unvetted_redirect_location_does_not_break_the_call(location, catalog, wire):
     """httpx vets Location only on 301/302/303/307/308; on a 300 it reaches us as it came."""
     wire(lambda request: httpx.Response(300, headers=[(b"location", location)]))
@@ -284,7 +310,7 @@ def test_redact_keeps_urls_without_query():
     assert server._redact("https://x.gov.br/a") == "https://x.gov.br/a"
 
 
-@pytest.mark.parametrize("method", ["GET", "HEAD", "DELETE"])
+@pytest.mark.parametrize("method", ["GET", "HEAD", "DELETE", "OPTIONS"])
 def test_call_api_rejects_a_body_on_methods_without_a_payload(method, catalog, wire):
     requests = wire()
     out = server.call_api("ibge-localidades", "/estados", method=method, body={"a": 1})
@@ -770,20 +796,40 @@ def test_send_falls_back_to_text_when_json_does_not_parse(wire):
     }
 
 
-@pytest.mark.parametrize(
-    "body",
-    [
-        pytest.param(b"[" * 50_000, id="nested-too-deep"),
-        pytest.param(b"1" * 5_000, id="integer-with-too-many-digits"),
-    ],
-)
-def test_json_that_python_refuses_to_parse_is_a_parse_error(body, wire):
+def test_json_nested_too_deep_is_a_parse_error(wire):
     wire(
         lambda request: httpx.Response(
-            200, content=body, headers={"content-type": "application/json"}
+            200, content=b"[" * 50_000, headers={"content-type": "application/json"}
         )
     )
     assert send()["body"]["parse_error"] == "content-type said JSON but body did not parse"
+
+
+def test_json_integer_with_too_many_digits_is_a_parse_error(wire):
+    limit = sys.get_int_max_str_digits()
+    if not 0 < limit < server.MAX_BODY_CHARS:
+        pytest.skip("the interpreter's integer digit limit is off or beyond the body cut")
+    wire(
+        lambda request: httpx.Response(
+            200, content=b"1" * (limit + 1), headers={"content-type": "application/json"}
+        )
+    )
+    assert send()["body"]["parse_error"] == "content-type said JSON but body did not parse"
+
+
+@pytest.mark.parametrize("charset", ["hex", "base64", "zlib", "bz2", "rot13"])
+def test_a_charset_that_is_not_a_text_codec_is_an_error(charset, catalog, wire):
+    """httpx accepts any registered codec as a charset and then fails to decode with it."""
+    wire(
+        lambda request: httpx.Response(
+            200, content=b"x", headers={"content-type": f"text/plain; charset={charset}"}
+        )
+    )
+    out = server.call_api("ibge-localidades", "/estados")
+    assert out == {
+        "error": f"upstream response could not be decoded (charset={charset})",
+        "status": 200,
+    }
 
 
 @pytest.mark.parametrize(("method", "status"), [("HEAD", 200), ("GET", 204)])
@@ -953,6 +999,26 @@ def test_credentials_status_without_id_lists_entries_that_need_auth(catalog):
     assert {"portal-transparencia", "datajud", "serpro-consulta-cnpj"} <= ids
     assert "ibge-localidades" not in ids  # auth: none
     assert all(catalog.get(i).auth != "none" and catalog.get(i).category != "conecta" for i in ids)
+
+
+def test_credentials_status_reports_a_credential_call_api_will_refuse(catalog, monkeypatch):
+    monkeypatch.setenv("DATAJUD_API_KEY", "SEC\x01RET")
+    [item] = server.credentials_status("datajud")
+    assert item["ready"] is False
+    assert item["reason"] == "credential in DATAJUD_API_KEY contains invalid characters"
+    assert item["env_vars"] == {"DATAJUD_API_KEY": True}  # it is set, just unusable
+    assert "SEC" not in str(item)
+
+
+def test_requires_contract_api_with_an_unusable_credential_says_why(catalog, wire, monkeypatch):
+    monkeypatch.setenv("SERPRO_CNPJ_CLIENT_ID", "id")
+    monkeypatch.setenv("SERPRO_CNPJ_CLIENT_SECRET", "se\udcffcret")  # a non-UTF-8 byte
+    requests = wire()
+    out = server.call_api(SERPRO_CNPJ, "/basica/00000000000191")
+    assert "credential in SERPRO_CNPJ_CLIENT_SECRET contains invalid characters" in out["hint"]
+    assert requests == []
+    [item] = server.credentials_status(SERPRO_CNPJ)
+    assert (item["ready"], item["callable"]) == (False, False)
 
 
 def test_credentials_status_marks_stubs_as_not_callable(catalog):
