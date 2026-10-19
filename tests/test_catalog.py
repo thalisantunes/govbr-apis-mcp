@@ -1,3 +1,5 @@
+import re
+
 import pytest
 import yaml
 
@@ -282,6 +284,24 @@ def test_apis_must_be_a_list_and_the_error_names_the_file(content, got, tmp_path
         Catalog.load(tmp_path / "base")
 
 
+@pytest.mark.parametrize(
+    ("overrides", "field"),
+    [
+        ({"auth_config": None}, "auth_config"),
+        ({"base_url": 5}, "base_url"),
+        ({"openapi_url": 5}, "openapi_url"),
+        ({"docs_url": 5}, "docs_url"),
+        ({"auth_config": {"token_url": 5}}, "auth_config.token_url"),
+    ],
+)
+def test_a_wrongly_typed_field_is_refused_at_load_with_file_id_and_field(
+    overrides, field, tmp_path, clean_env
+):
+    write_catalog(tmp_path / "base", "x.yaml", demo_entry(**overrides))
+    with pytest.raises(ValueError, match=rf"x\.yaml:demo: {re.escape(field)} must be"):
+        Catalog.load(tmp_path / "base")
+
+
 def test_an_entry_with_a_null_description_is_refused_at_load_with_file_and_id(tmp_path, clean_env):
     write_catalog(tmp_path / "base", "x.yaml", demo_entry(description=None))
     with pytest.raises(ValueError, match=r"x\.yaml:demo: description must be a string"):
@@ -343,6 +363,16 @@ REJECTED_ENTRIES = [
     ({"tags": "single"}, "tags must be a list of strings"),
     ({"tags": ["fine", 3]}, "tags must be a list of strings"),
     ({"notes": 7}, "notes must be a string or absent"),
+    # validate itself reads these as a mapping and as text
+    ({"auth_config": None}, "auth_config must be a mapping"),
+    ({"auth_config": ["env"]}, "auth_config must be a mapping"),
+    ({"base_url": 5}, "base_url must be a string or absent"),
+    ({"openapi_url": ["https://api.demo.gov.br/spec"]}, "openapi_url must be a string or absent"),
+    ({"docs_url": 1.5}, "docs_url must be a string or absent"),
+    (
+        {"auth": "oauth2_client_credentials", "auth_config": {"token_url": 7}},
+        "auth_config.token_url must be a string or absent",
+    ),
 ]
 
 

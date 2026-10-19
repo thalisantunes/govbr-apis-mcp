@@ -76,6 +76,14 @@ def host_allowed(url: str) -> bool:
     return any(host.endswith(suffix) for suffix in ALLOWED_HOST_SUFFIXES)
 
 
+def _text(value: object) -> bool:
+    return isinstance(value, str)
+
+
+def _text_or_none(value: object) -> bool:
+    return value is None or isinstance(value, str)
+
+
 def fold(text: str) -> str:
     """Lowercase and strip accents, so 'municípios' and 'municipios' both match."""
     decomposed = unicodedata.normalize("NFKD", text.lower())
@@ -111,22 +119,23 @@ class ApiEntry:
                 f"{where}: invalid id — must match {ID_RE.pattern} "
                 "(ids become cache lookup keys and must not contain path separators)"
             )
+        # What search(), get() and the checks below read: a wrong type must stop here, with the
+        # entry and the field named, not surface later as an AttributeError or a TypeError.
         for name, value, expected, fits in (
-            ("description", self.description, "a string", isinstance(self.description, str)),
+            ("description", self.description, "a string", _text),
             (
                 "tags",
                 self.tags,
                 "a list of strings",
-                isinstance(self.tags, list) and all(isinstance(tag, str) for tag in self.tags),
+                lambda tags: isinstance(tags, list) and all(map(_text, tags)),
             ),
-            (
-                "notes",
-                self.notes,
-                "a string or absent",
-                self.notes is None or isinstance(self.notes, str),
-            ),
+            ("notes", self.notes, "a string or absent", _text_or_none),
+            ("auth_config", self.auth_config, "a mapping", lambda cfg: isinstance(cfg, dict)),
+            ("base_url", self.base_url, "a string or absent", _text_or_none),
+            ("openapi_url", self.openapi_url, "a string or absent", _text_or_none),
+            ("docs_url", self.docs_url, "a string or absent", _text_or_none),
         ):
-            if not fits:
+            if not fits(value):
                 raise ValueError(f"{where}: {name} must be {expected} — got {value!r}")
         for name, value, allowed in (
             ("category", self.category, CATEGORIES),
@@ -156,6 +165,10 @@ class ApiEntry:
                 )
 
         token_url = self.auth_config.get("token_url")
+        if not _text_or_none(token_url):
+            raise ValueError(
+                f"{where}: auth_config.token_url must be a string or absent — got {token_url!r}"
+            )
         if token_url and (not token_url.startswith("https://") or not host_allowed(token_url)):
             raise ValueError(
                 f"{where}: auth_config.token_url not https/allowlisted ({token_url!r})"
