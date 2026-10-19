@@ -3,7 +3,7 @@
   "name": "io.github.thalisantunes/govbr-apis-mcp",
   "title": "gov.br APIs MCP",
   "description": "Brazilian government APIs through a spec-driven gateway over a YAML catalog.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "repository": {
     "url": "https://github.com/thalisantunes/govbr-apis-mcp",
     "source": "github"
@@ -13,7 +13,7 @@
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "govbr-apis-mcp",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"

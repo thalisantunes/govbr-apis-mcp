@@ -1,6 +1,6 @@
 [project]
 name = "govbr-apis-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP server exposing Brazilian government APIs (public, Serpro commercial and Conecta gov.br) through a spec-driven gateway"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -46,7 +46,7 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.setuptools.package-data]
-govbr_apis_mcp = ["catalog_data/*.yaml"]
+govbr_apis_mcp = ["catalog_data/*.yaml", "catalog_data/*.yml"]
 
 [tool.ruff]
 line-length = 100
