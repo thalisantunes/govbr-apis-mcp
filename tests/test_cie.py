@@ -22,7 +22,7 @@ from govbr_apis_mcp.cie import (
 # Before the 2026-09-30 expiries below: those cards are valid today but expire before the
 # 2026-12-20 event, which is what tells "checked against the event" from "against today".
 TODAY = date(2026, 8, 7)
-CODE = "AB12CD34"
+CODE = "FAKE0001"
 
 
 def reply(body, status=200):
@@ -146,7 +146,7 @@ def test_check_sends_expected_request():
 
 
 FESN_OK = {
-    "useCode": "AB12CD34",
+    "useCode": "FAKE0001",
     "name": "FULANA DE TAL",
     "birth": "1990-01-01T00:00:00",
     "cpf": "00000000000",
@@ -185,14 +185,14 @@ def test_fesn_empty_body_has_no_verdict():
 
 
 def test_check_any_falls_back_to_fesn(monkeypatch):
-    """A legitimate card unknown to DNE must not be denied — the real AB12CD34 case."""
+    """A legitimate card unknown to DNE must not be denied."""
 
     def fake_call(api_id, path, **kwargs):
         if api_id == "meiaentrada-cie-validador":
             return reply({"status": False, "codigoRetorno": "2"})
         return reply(FESN_OK)
 
-    d = check_any("AB12CD34", "1990-01-01", "Show", "00000000000191", caller=fake_call)
+    d = check_any("FAKE0001", "1990-01-01", "Show", "00000000000191", caller=fake_call)
     assert d.eligible and d.provider == "fesn"
 
 
@@ -202,7 +202,7 @@ def test_check_any_propagates_event_date_to_fesn():
             return reply({"status": False, "codigoRetorno": "2"})
         return reply({**FESN_OK, "validity": "2026-09-30 23:59:59"})
 
-    d = check_any("AB12CD34", "1990-01-01", "Show", "00000000000191", "2026-12-20", fake_call)
+    d = check_any("FAKE0001", "1990-01-01", "Show", "00000000000191", "2026-12-20", fake_call)
     assert not d.eligible
 
 
@@ -373,7 +373,7 @@ def call_dne(response):
     return check("A", "20000115", "e", "00000000000191", caller=lambda *a, **k: response)
 
 
-def call_fesn(response, codigo="AB12CD34"):
+def call_fesn(response, codigo="FAKE0001"):
     return check_fesn(codigo, caller=lambda *a, **k: response)
 
 
@@ -471,7 +471,7 @@ def test_check_any_still_approves_via_fesn_when_dne_is_unreachable():
             return {"error": "MEIAENTRADA_CODIGO_ACESSO não definido"}
         return reply(FESN_OK)
 
-    d = check_any("AB12CD34", "1990-01-01", "Show", "00000000000191", caller=fake_call)
+    d = check_any("FAKE0001", "1990-01-01", "Show", "00000000000191", caller=fake_call)
     assert d.eligible and d.validated and d.provider == "fesn"
 
 
@@ -508,13 +508,13 @@ def test_fesn_200_valid_card_is_approved_end_to_end():
     assert d.eligible and d.validated and d.provider == "fesn"
     assert captured == {
         "api_id": "fesn-cie-validador",
-        "path": "/api/students/usecode/AB12CD34",
+        "path": "/api/students/usecode/FAKE0001",
         "method": "GET",
     }
 
 
 def test_fesn_use_code_is_compared_ignoring_case_and_padding():
-    assert call_fesn(reply({**FESN_OK, "useCode": "ab12cd34"}), " AB12CD34 ").eligible
+    assert call_fesn(reply({**FESN_OK, "useCode": "fake0001"}), " FAKE0001 ").eligible
 
 
 @pytest.mark.parametrize("returned", [None, "", "  "])
@@ -566,7 +566,7 @@ def test_fesn_rejects_codes_that_would_change_the_requested_resource(codigo):
         check_fesn(codigo, caller=must_not_be_called)
 
 
-@pytest.mark.parametrize("codigo", ["AB12CD34", "ab-12_cd.34", "A", "A" * 64, "0000123"])
+@pytest.mark.parametrize("codigo", ["FAKE0001", "fa-00_ke.01", "A", "A" * 64, "0000123"])
 def test_fesn_accepts_plain_use_codes_and_puts_them_in_the_path_as_is(codigo):
     seen = {}
 
@@ -718,7 +718,7 @@ def test_eligible_decisions_keep_the_full_payload():
 
 def test_check_any_combined_decision_keeps_no_personal_data():
     caller = dne_and_fesn(DNE_NOT_FOUND, reply(FESN_OK))
-    d = check_any("AB12CD34", "1990-01-02", "e", "00000000000191", caller=caller)
+    d = check_any("FAKE0001", "1990-01-02", "e", "00000000000191", caller=caller)
     assert not d.eligible and d.provider is None
     assert_no_personal_data(d)
 

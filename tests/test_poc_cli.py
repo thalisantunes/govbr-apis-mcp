@@ -20,7 +20,7 @@ from govbr_apis_mcp import cie, server
 SCRIPT = Path(__file__).resolve().parents[1] / "poc" / "validar_cie.py"
 DNE = "meiaentrada-cie-validador"
 FESN_CARD = {
-    "useCode": "AB12CD34",
+    "useCode": "FAKE0001",
     "name": "FULANA DE TAL",
     "birth": "1990-01-01T00:00:00",
     "cpf": "00000000000",
@@ -128,7 +128,7 @@ def test_missing_arguments_exit_2_and_name_them():
 
 def test_fesn_needs_only_the_use_code(poc, monkeypatch, capsys):
     gateway(monkeypatch, fesn=reply(FESN_CARD))
-    argv = ["--provedor", "fesn", "--codigo-uso", "AB12CD34", "--data-evento", "2026-12-20"]
+    argv = ["--provedor", "fesn", "--codigo-uso", "FAKE0001", "--data-evento", "2026-12-20"]
     assert poc.main(argv) == 0
     assert "ELEGIVEL" in capsys.readouterr().out
 
@@ -151,13 +151,13 @@ def test_dne_without_credential_exits_2(poc, monkeypatch, capsys):
         (["--provedor", "dne", *dne_argv(nascimento="20261399")], "dataNascimento"),
         (["--provedor", "dne", *dne_argv(cnpj="123")], "cnpjPromotor"),
         (["--provedor", "fesn", "--codigo-uso", "AB/12"], "codigoUso"),
-        (["--provedor", "fesn", "--codigo-uso", "AB12CD34", "--nascimento", ""], "dataNascimento"),
+        (["--provedor", "fesn", "--codigo-uso", "FAKE0001", "--nascimento", ""], "dataNascimento"),
         (
-            ["--provedor", "fesn", "--codigo-uso", "AB12CD34", "--data-evento", "2026-13-45"],
+            ["--provedor", "fesn", "--codigo-uso", "FAKE0001", "--data-evento", "2026-13-45"],
             "dataEvento",
         ),
-        (["--provedor", "fesn", "--codigo-uso", "AB12CD34", "--data-evento", ""], "dataEvento"),
-        (["--provedor", "fesn", "--codigo-uso", "AB12CD34", "--data-evento", "  "], "dataEvento"),
+        (["--provedor", "fesn", "--codigo-uso", "FAKE0001", "--data-evento", ""], "dataEvento"),
+        (["--provedor", "fesn", "--codigo-uso", "FAKE0001", "--data-evento", "  "], "dataEvento"),
         (["--provedor", "dne", *dne_argv(), "--data-evento", ""], "dataEvento"),
         (["--provedor", "auto", *dne_argv(), "--data-evento", ""], "dataEvento"),
     ],
@@ -177,7 +177,7 @@ def test_invalid_input_exits_2_names_the_field_and_never_reaches_the_gateway(
 def test_fesn_honours_the_event_date(poc, monkeypatch, capsys):
     """A card valid until 2026-09-30 is fine today (2026-08-07) but not for a December show."""
     gateway(monkeypatch, fesn=reply({**FESN_CARD, "validity": "2026-09-30 23:59:59"}))
-    base = ["--provedor", "fesn", "--codigo-uso", "AB12CD34"]
+    base = ["--provedor", "fesn", "--codigo-uso", "FAKE0001"]
     assert poc.main(base) == 0
     assert poc.main([*base, "--data-evento", "2026-12-20"]) == 1
     assert "antes da data do evento" in capsys.readouterr().out
@@ -186,7 +186,7 @@ def test_fesn_honours_the_event_date(poc, monkeypatch, capsys):
 def test_auto_and_fesn_agree_on_the_same_expired_card(poc, monkeypatch):
     expired_fesn = reply({**FESN_CARD, "validity": "2026-09-30 23:59:59"})
     gateway(monkeypatch, dne=reply({"status": False, "codigoRetorno": "2"}), fesn=expired_fesn)
-    event = ["--data-evento", "2026-12-20", "--codigo-uso", "AB12CD34"]
+    event = ["--data-evento", "2026-12-20", "--codigo-uso", "FAKE0001"]
     auto = poc.main(
         ["--provedor", "auto", "--nascimento", "1990-01-01", "--cnpj", "1" * 14, *event]
     )
@@ -247,7 +247,7 @@ def test_dne_exit_codes(poc, monkeypatch, dne, expected):
 def test_auto_exit_codes(poc, monkeypatch, dne, fesn, expected):
     gateway(monkeypatch, dne=dne, fesn=fesn)
     argv = ["--provedor", "auto", "--data-evento", "2026-12-20", "--nascimento", "1990-01-01"]
-    assert poc.main([*argv, "--codigo-uso", "AB12CD34", "--cnpj", "1" * 14]) == expected
+    assert poc.main([*argv, "--codigo-uso", "FAKE0001", "--cnpj", "1" * 14]) == expected
 
 
 def test_a_crash_is_not_a_verdict_it_exits_3_with_the_cause_on_stderr(poc, monkeypatch, capsys):
@@ -291,7 +291,7 @@ def test_not_validated_is_labelled_and_serialised_as_such(poc, monkeypatch, caps
 )
 def test_fesn_exit_codes(poc, monkeypatch, fesn, extra, expected):
     gateway(monkeypatch, fesn=fesn)
-    argv = ["--provedor", "fesn", "--codigo-uso", "AB12CD34", "--data-evento", "2026-12-20"]
+    argv = ["--provedor", "fesn", "--codigo-uso", "FAKE0001", "--data-evento", "2026-12-20"]
     assert poc.main([*argv, *extra]) == expected
 
 
@@ -377,10 +377,10 @@ def test_help_limits_the_missing_credential_exit_to_the_dne_provider():
 def test_missing_credential_is_exit_2_only_with_the_dne_provider(poc, monkeypatch):
     monkeypatch.delenv("MEIAENTRADA_CODIGO_ACESSO")
     no_key = {"error": "meiaentrada-cie-validador requires env var MEIAENTRADA_CODIGO_ACESSO"}
-    fesn_argv = ["--provedor", "fesn", "--codigo-uso", "AB12CD34", "--data-evento", "2026-12-20"]
+    fesn_argv = ["--provedor", "fesn", "--codigo-uso", "FAKE0001", "--data-evento", "2026-12-20"]
     auto_argv = [
         *["--provedor", "auto", "--data-evento", "2026-12-20"],
-        *dne_argv(codigo_uso="AB12CD34", nascimento="1990-01-01"),  # the FESN card's birth date
+        *dne_argv(codigo_uso="FAKE0001", nascimento="1990-01-01"),  # the FESN card's birth date
     ]
 
     gateway(monkeypatch, fesn=reply(FESN_CARD))  # FESN never needed it

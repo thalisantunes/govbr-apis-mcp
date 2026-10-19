@@ -18,6 +18,29 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+      - name: Check the version in pyproject.toml, server.json and the release tag
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import tomllib
+
+          with open("pyproject.toml", "rb") as f:
+              pyproject = tomllib.load(f)["project"]["version"]
+          with open("server.json", encoding="utf-8") as f:
+              server = json.load(f)
+          versions = {
+              "pyproject.toml": pyproject,
+              "server.json version": server["version"],
+              "server.json packages[0].version": server["packages"][0]["version"],
+          }
+          if os.environ["GITHUB_EVENT_NAME"] == "release":
+              versions["release tag"] = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          if len(set(versions.values())) != 1:
+              report = "\n".join(f"  {source}: {value}" for source, value in versions.items())
+              raise SystemExit(f"The versions disagree, fix them before releasing:\n{report}")
+          print(f"All versions agree: {pyproject}")
+          PY
       - run: python -m pip install --upgrade build twine
       - run: python -m pip install -e '.[dev]'
       - run: ruff check .
@@ -51,3 +74,46 @@ jobs:
           name: dist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  mcp-registry:
+    # Releases only: the Registry takes each version once. It also checks that govbr-apis-mcp
+    # is on PyPI with the mcp-name marker in its README, so this waits for "publish".
+    needs: publish
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      # To update, set a newer release tag (github.com/modelcontextprotocol/registry/releases).
+      MCP_PUBLISHER_VERSION: v1.8.1
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Install mcp-publisher
+        run: |
+          asset=mcp-publisher_linux_amd64.tar.gz
+          checksums=registry_${MCP_PUBLISHER_VERSION#v}_checksums.txt
+          base=https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}
+          curl -fsSL -O "$base/$asset"
+          curl -fsSL -O "$base/$checksums"
+          awk -v asset="$asset" '$2 == asset' "$checksums" | sha256sum -c -
+          tar xzf "$asset" mcp-publisher
+      # Before the login, so the token is still fresh when publish runs.
+      - name: Wait for the release on PyPI
+        run: |
+          version=$(jq -r '.packages[0].version' server.json)
+          for attempt in $(seq 1 10); do
+            if curl -fsS -o /dev/null "https://pypi.org/pypi/govbr-apis-mcp/${version}/json"; then
+              exit 0
+            fi
+            echo "govbr-apis-mcp ${version} is not on PyPI yet (attempt ${attempt} of 10)"
+            sleep 30
+          done
+          echo "::error::govbr-apis-mcp ${version} did not show up on PyPI"
+          exit 1
+      - name: Log in to the MCP Registry
+        run: ./mcp-publisher login github-oidc
+      - name: Publish server.json to the MCP Registry
+        run: ./mcp-publisher publish

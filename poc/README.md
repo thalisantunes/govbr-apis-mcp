@@ -39,7 +39,7 @@ Só o DNE (`--provedor auto`, o padrão, e `--provedor dne`) pede `--nascimento`
 Para consultar apenas a FESN, que não pede credencial, basta o código de uso:
 
 ```bash
-.venv/bin/python poc/validar_cie.py --provedor fesn --codigo-uso AB12CD34 --data-evento 2026-12-20
+.venv/bin/python poc/validar_cie.py --provedor fesn --codigo-uso FAKE0001 --data-evento 2026-12-20
 ```
 
 `--data-evento` vale para todos os provedores: a validade da carteirinha é conferida contra
