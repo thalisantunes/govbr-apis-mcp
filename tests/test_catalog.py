@@ -1,7 +1,7 @@
 import pytest
 
 from govbr_apis_mcp import auth
-from govbr_apis_mcp.catalog import STATUSES, Catalog
+from govbr_apis_mcp.catalog import DEFAULT_CATALOG_DIR, STATUSES, Catalog
 from govbr_apis_mcp.openapi import describe_operation, summarize_spec
 
 
@@ -14,6 +14,16 @@ def test_catalog_loads_all_categories(catalog: Catalog):
     categories = {e.category for e in catalog.list()}
     assert categories == {"public", "serpro", "conecta", "meia-entrada"}
     assert len(catalog.list(category="conecta")) >= 90
+
+
+def test_default_catalog_dir_has_the_four_tier_files():
+    assert DEFAULT_CATALOG_DIR.is_dir()
+    assert sorted(path.name for path in DEFAULT_CATALOG_DIR.glob("*.yaml")) == [
+        "conecta.yaml",
+        "meia_entrada.yaml",
+        "public.yaml",
+        "serpro.yaml",
+    ]
 
 
 def test_ids_unique_and_wellformed(catalog: Catalog):

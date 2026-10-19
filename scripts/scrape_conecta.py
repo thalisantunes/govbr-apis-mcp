@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scrape the Conecta gov.br catalog listing into catalog/conecta.yaml.
+"""Scrape the Conecta gov.br catalog listing into src/govbr_apis_mcp/catalog/conecta.yaml.
 
 The Conecta catalog page is static HTML with one <a class="api-card"> per API.
 All Conecta APIs require adhesion as a public-sector entity, so every entry is
@@ -16,6 +16,7 @@ from pathlib import Path
 import yaml
 
 CATALOG_URL = "https://www.gov.br/conecta/catalogo/"
+DEFAULT_OUT = Path(__file__).resolve().parents[1] / "src/govbr_apis_mcp/catalog/conecta.yaml"
 CARD_RE = re.compile(
     r'<a href="(?P<url>https://www\.gov\.br/conecta/catalogo/apis/[^"]+)"\s+class="api-card">'
     r".*?<p class=\"title\">(?P<title>.*?)</p>"
@@ -33,7 +34,7 @@ def clean(text: str) -> str:
 
 
 def main() -> None:
-    out_path = Path(sys.argv[1] if len(sys.argv) > 1 else "catalog/conecta.yaml")
+    out_path = Path(sys.argv[1] if len(sys.argv) > 1 else DEFAULT_OUT)
     with urllib.request.urlopen(CATALOG_URL, timeout=30) as resp:
         html = resp.read().decode("utf-8")
 
