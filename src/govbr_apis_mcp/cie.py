@@ -22,7 +22,13 @@ from zoneinfo import ZoneInfo
 
 API_ID = "meiaentrada-cie-validador"
 VALIDATOR_PATH = "/public/validador"
-DATE_RE = re.compile(r"^\d{8}$")
+# Every date the issuers (and our callers) use: YYYY-MM-DD optionally followed by a time,
+# YYYYMMDD and DD/MM/YYYY. Anything else is not a date, so it can never be read as one.
+DATE_FORMATS = (
+    (re.compile(r"(\d{4}-\d{2}-\d{2})(?:[T ]\d.*)?", re.ASCII), "%Y-%m-%d"),
+    (re.compile(r"(\d{8})", re.ASCII), "%Y%m%d"),
+    (re.compile(r"(\d{2}/\d{2}/\d{4})", re.ASCII), "%d/%m/%Y"),
+)
 
 # Observed on the live API. Anything unmapped falls back to the API's own `mensagem`.
 # Code 2 is ambiguous by design: the API answers "documento inexistente" both for an
@@ -58,16 +64,37 @@ class CieDecision:
         }
 
 
+def parse_date(value: Any) -> date | None:
+    """Read a date in any format the issuers use; None if it is not a real calendar date.
+
+    Accepts YYYY-MM-DD (optionally followed by T or a space and a time), YYYYMMDD and
+    DD/MM/YYYY. Dates must be compared as dates, never as text: as strings "20260930"
+    sorts after "2026-12-20", so an expired card used to pass.
+    """
+    if not isinstance(value, str):
+        return None
+    for pattern, fmt in DATE_FORMATS:
+        match = pattern.fullmatch(value.strip())
+        if match:
+            try:
+                return datetime.strptime(match.group(1), fmt).date()
+            except ValueError:  # right shape, impossible date (month 13, 31 April...)
+                return None
+    return None
+
+
+def _require_date(value: str, field_name: str) -> date:
+    parsed = parse_date(value)
+    if parsed is None:
+        raise InvalidInput(f"{field_name}: use YYYYMMDD, YYYY-MM-DD ou DD/MM/YYYY — got {value!r}")
+    if not 1900 <= parsed.year <= 2100:
+        raise InvalidInput(f"{field_name}: {value!r} does not look like a date")
+    return parsed
+
+
 def normalize_date(value: str, field_name: str) -> str:
     """Accept YYYYMMDD, YYYY-MM-DD or DD/MM/YYYY; always send YYYYMMDD."""
-    digits = re.sub(r"\D", "", value or "")
-    if len(digits) != 8:
-        raise InvalidInput(f"{field_name}: use YYYYMMDD, YYYY-MM-DD ou DD/MM/YYYY — got {value!r}")
-    if "/" in (value or "") and not (value or "").startswith(digits[:4]):
-        digits = digits[4:] + digits[2:4] + digits[:2]  # DD/MM/YYYY -> YYYYMMDD
-    if not DATE_RE.match(digits) or not 1900 <= int(digits[:4]) <= 2100:
-        raise InvalidInput(f"{field_name}: {value!r} does not look like a date")
-    return digits
+    return _require_date(value, field_name).strftime("%Y%m%d")
 
 
 def today_br(now: datetime | None = None) -> date:
@@ -136,15 +163,11 @@ def interpret(payload: dict[str, Any], data_evento: str | None = None) -> CieDec
             if payload.get(key)
         }
         holder["has_photo"] = bool(payload.get("foto") or payload.get("urlFoto"))
-        expires = (payload.get("dataExpiracao") or "")[:10]
-        if expires and expires < expiry_reference(data_evento):
-            return CieDecision(
-                False,
-                f"carteirinha vence em {expires}, antes da data do evento",
-                {},
-                payload,
-                "dne",
-            )
+        problem = _expiry_problem(
+            parse_date(payload.get("dataExpiracao")), expiry_reference(data_evento)
+        )
+        if problem:
+            return CieDecision(False, problem, {}, payload, "dne")
         return CieDecision(True, message or "CIE válida", holder, payload)
 
     reason = RETURN_CODES.get(code or "", message or "CIE não validada")
@@ -193,16 +216,27 @@ FESN_API_ID = "fesn-cie-validador"
 FESN_PATH = "/api/students/usecode"
 
 
-def expiry_reference(data_evento: str | None) -> str:
+def expiry_reference(data_evento: str | None) -> date:
     """The date a card's validity must be checked against: the event, not the purchase.
 
     Checking against today lets a card expiring in September approve a ticket for a
     December show — buying early, not sophisticated fraud.
     """
     if data_evento:
-        digits = normalize_date(data_evento, "dataEvento")
-        return f"{digits[:4]}-{digits[4:6]}-{digits[6:]}"
-    return today_br().strftime("%Y-%m-%d")
+        return _require_date(data_evento, "dataEvento")
+    return today_br()
+
+
+def _expiry_problem(expires: date | None, event_day: date) -> str | None:
+    """Why a card cannot be accepted for `event_day`, or None when its validity covers it.
+
+    Fails closed: with no readable expiry there is no way to know the card is still valid.
+    """
+    if expires is None:
+        return "validade não informada/ilegível — sem como confirmar que cobre a data do evento"
+    if expires < event_day:
+        return f"carteirinha vence em {expires.isoformat()}, antes da data do evento"
+    return None
 
 
 def interpret_fesn(
@@ -227,15 +261,10 @@ def interpret_fesn(
     if not payload.get("useCode") and not payload.get("name"):
         return CieDecision(False, "carteirinha não encontrada na base FESN", {}, payload, "fesn")
 
-    validity = (payload.get("validity") or "")[:10]
-    if validity and validity < expiry_reference(data_evento):
-        return CieDecision(
-            False,
-            f"carteirinha vence em {validity}, antes da data do evento",
-            {},
-            payload,
-            "fesn",
-        )
+    expires = parse_date(payload.get("validity"))
+    problem = _expiry_problem(expires, expiry_reference(data_evento))
+    if problem:
+        return CieDecision(False, problem, {}, payload, "fesn")
 
     birth = (payload.get("birth") or "")[:10].replace("-", "")
     if data_nascimento and birth:
@@ -257,7 +286,7 @@ def interpret_fesn(
         "curso": payload.get("course"),
         "nivelEscolaridade": payload.get("courseType"),
         "entidade": "FESN",
-        "dataExpiracao": validity or None,
+        "dataExpiracao": expires.isoformat(),
         "urlFoto": payload.get("photo"),
     }
     holder = {k: v for k, v in holder.items() if v}

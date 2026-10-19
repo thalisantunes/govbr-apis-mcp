@@ -32,7 +32,9 @@ def test_normalize_date_accepts_common_formats(value, expected):
     assert normalize_date(value, "dataNascimento") == expected
 
 
-@pytest.mark.parametrize("value", ["15012000x", "2000", "", "não é data"])
+@pytest.mark.parametrize(
+    "value", ["15012000x", "2000", "", "não é data", "2000/01/15", "15.01.2000", None]
+)
 def test_normalize_date_rejects_garbage(value):
     with pytest.raises(InvalidInput):
         normalize_date(value, "dataNascimento")
@@ -70,6 +72,7 @@ def test_interpret_approved_extracts_holder():
             "instituicao": "UFMG",
             "urlFoto": "https://x/y.jpg",
             "curso": None,
+            "dataExpiracao": "20270331",
         }
     )
     assert d.eligible
@@ -79,7 +82,7 @@ def test_interpret_approved_extracts_holder():
 
 def test_interpret_accepts_status_as_string():
     """The API returns the string "true" in some paths — the front-end handles both."""
-    assert interpret({"status": "true", "nome": "X"}).eligible
+    assert interpret({"status": "true", "nome": "X", "dataExpiracao": "20270331"}).eligible
 
 
 def test_interpret_maps_known_return_codes():
@@ -113,7 +116,7 @@ def test_check_sends_expected_request():
 
     def fake_call(api_id, path, method=None, body=None, **kwargs):
         captured.update(api_id=api_id, path=path, method=method, body=body)
-        return {"body": {"status": True, "nome": "MARIA"}}
+        return {"body": {"status": True, "nome": "MARIA", "dataExpiracao": "20270331"}}
 
     d = check("ABC", "2000-01-15", "Show", "00000000000191", "2026-09-07", caller=fake_call)
     assert d.eligible
@@ -245,3 +248,90 @@ def test_card_is_still_valid_on_its_last_day_late_in_the_evening(monkeypatch):
 
 def test_clock_is_pinned_for_the_whole_module():
     assert cie.today_br() == TODAY
+
+
+# --- dates: one parser, a real calendar, compared as dates ------------------------
+
+
+@pytest.mark.parametrize(
+    "value", ["20261399", "2026-02-30", "31/04/2026", "2023-02-29", "00000000", "2026-00-10"]
+)
+def test_normalize_date_rejects_impossible_calendar_dates(value):
+    with pytest.raises(InvalidInput):
+        normalize_date(value, "dataEvento")
+
+
+@pytest.mark.parametrize("value", ["2024-02-29", "29/02/2024", "20240229"])
+def test_normalize_date_accepts_a_real_leap_day(value):
+    assert normalize_date(value, "dataEvento") == "20240229"
+
+
+EXPIRED = ["20260930", "2026-09-30", "30/09/2026", "2026-09-30T23:59:59", "2026-09-30 23:59:59"]
+VALID_THROUGH_EVENT = [
+    "20270331",
+    "2027-03-31",
+    "31/03/2027",
+    "2027-03-31T23:59:59",
+    "2027-03-31 23:59:59",
+]
+
+
+@pytest.mark.parametrize("expiry", EXPIRED)
+def test_dne_expiry_is_compared_as_a_date_in_every_format(expiry):
+    """YYYYMMDD used to be compared as text with an ISO date: "20260930" > "2026-12-20"."""
+    d = interpret({"status": True, "nome": "X", "dataExpiracao": expiry}, data_evento="2026-12-20")
+    assert not d.eligible and "antes da data do evento" in d.reason and d.holder == {}
+
+
+@pytest.mark.parametrize("expiry", VALID_THROUGH_EVENT)
+def test_dne_card_valid_through_the_event_passes_in_every_format(expiry):
+    d = interpret({"status": True, "nome": "X", "dataExpiracao": expiry}, data_evento="2026-12-20")
+    assert d.eligible
+
+
+@pytest.mark.parametrize("expiry", EXPIRED)
+def test_fesn_expiry_is_compared_as_a_date_in_every_format(expiry):
+    d = interpret_fesn({**FESN_OK, "validity": expiry}, None, "2026-12-20")
+    assert not d.eligible and "antes da data do evento" in d.reason
+
+
+@pytest.mark.parametrize("expiry", VALID_THROUGH_EVENT)
+def test_fesn_card_valid_through_the_event_passes_in_every_format(expiry):
+    d = interpret_fesn({**FESN_OK, "validity": expiry}, None, "2026-12-20")
+    assert d.eligible and d.holder["dataExpiracao"] == "2027-03-31"
+
+
+def test_card_is_valid_through_the_event_day_itself():
+    payload = {"status": True, "nome": "X"}
+    assert interpret({**payload, "dataExpiracao": "2026-12-20"}, data_evento="20261220").eligible
+    assert not interpret(
+        {**payload, "dataExpiracao": "2026-12-19"}, data_evento="20261220"
+    ).eligible
+
+
+@pytest.mark.parametrize(
+    "expiry", [None, "", "   ", "amanhã", "2027-13-01", "31-03-2027", "2027-03-31x", "2027-02-30"]
+)
+def test_dne_missing_or_unreadable_expiry_fails_closed(expiry):
+    payload = {"status": True, "nome": "X", "cpf": "123"}
+    if expiry is not None:
+        payload["dataExpiracao"] = expiry
+    d = interpret(payload, data_evento="2026-12-20")
+    assert not d.eligible and "validade não informada/ilegível" in d.reason and d.holder == {}
+
+
+@pytest.mark.parametrize(
+    "expiry", [None, "", "   ", "amanhã", "2027-13-01", "31-03-2027", "2027-03-31x", "2027-02-30"]
+)
+def test_fesn_missing_or_unreadable_validity_fails_closed(expiry):
+    payload = {k: v for k, v in FESN_OK.items() if k != "validity"}
+    if expiry is not None:
+        payload["validity"] = expiry
+    d = interpret_fesn(payload, None, "2026-12-20")
+    assert not d.eligible and "validade não informada/ilegível" in d.reason
+
+
+def test_expiry_without_event_date_uses_the_pinned_brazilian_today():
+    payload = {"status": True, "nome": "X"}
+    assert interpret({**payload, "dataExpiracao": "20261019"}).eligible  # TODAY, last day
+    assert not interpret({**payload, "dataExpiracao": "20261018"}).eligible
