@@ -8,36 +8,108 @@ call to invoke it with the right auth profile.
 
 from __future__ import annotations
 
+import http.cookiejar
 import json
+import logging
 import posixpath
+import re
 from typing import Any
 from urllib.parse import unquote
 
 import httpx
 from mcp.server.mcpserver import MCPServer
 
+from . import __version__
 from . import auth as auth_module
-from .catalog import CATEGORIES, STATUSES, Catalog
+from .catalog import CATEGORIES, STATUSES, ApiEntry, Catalog
 from .openapi import describe_operation, fetch_spec, summarize_spec
 
 MAX_BODY_CHARS = 60_000
 DEFAULT_LIST_LIMIT = 40
 SENSITIVE_PARAM_HINTS = ("key", "token", "secret", "senha", "password", "chave")
-# Headers the caller may not set: they would override the catalog-managed
-# credential or redirect the request to another virtual host.
-PROTECTED_HEADERS = {"authorization", "host", "cookie"}
+ALLOWED_METHODS = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
+# Headers the caller may not set: they would override the catalog-managed credential,
+# redirect the request to another virtual host, tamper with its framing, make a proxy in
+# front of the API route, rewrite or re-method the request, or vouch for the client's IP,
+# or defeat the response size cut (Accept-Encoding stays "identity" so streaming really
+# stops at MAX_BODY_CHARS instead of after inflating a compressed chunk). X-Forwarded-*
+# is matched by prefix and the entry's own credential header is added per call. Names are
+# compared with '_' read as '-', as CGI/WSGI/PHP backends do (that is how a `Proxy` header
+# becomes the HTTP_PROXY of httpoxy).
+PROTECTED_HEADERS = frozenset(
+    {
+        "authorization",
+        "proxy-authorization",
+        "host",
+        "cookie",
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "upgrade",
+        "te",
+        "trailer",
+        "keep-alive",
+        "forwarded",
+        "accept-encoding",
+        "x-http-method-override",
+        "x-http-method",
+        "x-method-override",
+        "x-original-url",
+        "x-rewrite-url",
+        "x-real-ip",
+        "x-client-ip",
+        "x-cluster-client-ip",
+        "x-host",
+        "x-originating-ip",
+        "true-client-ip",
+        "cf-connecting-ip",
+        "client-ip",
+        "proxy",
+        "proxy-connection",
+        "via",
+        "max-forwards",
+    }
+)
+HEADER_NAME_RE = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")  # an RFC 9110 token
 
-mcp = MCPServer("govbr-apis-mcp")
+
+def _new_client(**kwargs: Any) -> httpx.Client:
+    """The gateway's one HTTP client (tests pass a MockTransport).
+
+    follow_redirects stays False: these requests carry credentials, so a 3xx must not steer them.
+    Redirect handling for spec fetches lives in openapi.py. Cookies are refused outright: one
+    shared jar would hand a cookie an API set for its whole domain suffix (.leg.br, .jus.br)
+    to every other API under it.
+    """
+    client = httpx.Client(
+        timeout=30, headers={"User-Agent": f"govbr-apis-mcp/{__version__}"}, **kwargs
+    )
+    client.cookies.jar.set_policy(http.cookiejar.DefaultCookiePolicy(allowed_domains=[]))
+    return client
+
+
+mcp = MCPServer("govbr-apis-mcp", version=__version__)
 _catalog: Catalog | None = None
-# follow_redirects stays False: these requests carry credentials and must not be
-# steered to another host by a 3xx. Spec fetches (openapi.py) opt in explicitly.
-_client = httpx.Client(timeout=30, headers={"User-Agent": "govbr-apis-mcp/0.2"})
+_client = _new_client()
+# The SDK enables INFO logging, and httpx then logs "HTTP Request: GET <url>" with the full
+# query string, bypassing _redact. Done at import rather than in main(): cie.py and scripts
+# use this module as a library.
+for _logger in ("httpx", "httpcore"):
+    logging.getLogger(_logger).setLevel(logging.WARNING)
+
+
+class CatalogError(Exception):
+    """The catalog could not be loaded; the message says why."""
 
 
 def get_catalog() -> Catalog:
     global _catalog
     if _catalog is None:
-        _catalog = Catalog.load()
+        try:
+            _catalog = Catalog.load()
+        except Exception as exc:  # noqa: BLE001 — whatever is wrong with the files, say so
+            message = f"The API catalog could not be loaded ({type(exc).__name__}): {exc}"
+            raise CatalogError(message) from None
     return _catalog
 
 
@@ -52,7 +124,7 @@ def search_catalog(query: str, category: str | None = None) -> dict[str, Any]:
     """
     try:
         matches = get_catalog().search(query, category=category)
-    except ValueError as exc:
+    except (CatalogError, ValueError) as exc:
         return {"error": str(exc)}
     shown = matches[:DEFAULT_LIST_LIMIT]
     return {
@@ -76,6 +148,8 @@ def list_apis(
     """
     try:
         entries = get_catalog().list(category=category, status=status)
+    except CatalogError as exc:
+        return {"error": str(exc)}
     except ValueError as exc:
         return {
             "error": str(exc),
@@ -104,7 +178,7 @@ def describe_api(api_id: str, path: str | None = None, method: str | None = None
     """
     try:
         entry = get_catalog().get(api_id)
-    except KeyError as exc:
+    except (KeyError, CatalogError) as exc:
         return {"error": str(exc)}
 
     result: dict[str, Any] = {"api": entry.detail()}
@@ -134,123 +208,257 @@ def call_api(
     body: dict[str, Any] | None = None,
     headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Call an endpoint of a catalog API, resolving base URL and auth automatically.
+    """Call an endpoint of a catalog API; base URL and credentials are resolved for you.
 
-    `path` is appended to the API's base_url (e.g. '/estados/mg' for ibge-localidades)
-    and may carry its own query string, which is merged with `query`. It cannot
-    escape the base URL's prefix. `body` is sent as JSON — only use it with methods
-    that accept a payload (POST/PUT/PATCH).
+    `path` is relative to the API's base_url (e.g. '/estados/mg') and may carry a query
+    string; `query` overrides its keys, and a list value repeats a key. `method` is GET,
+    HEAD, POST, PUT, PATCH, DELETE or OPTIONS; send `body` (JSON) only with POST/PUT/PATCH.
+    Credential, Host, proxy and framing headers in `headers` are dropped and listed in
+    `ignored_headers`.
 
-    Returns {status, url, body}; JSON bodies come back parsed, others as text,
-    truncated at 60k chars. Entries flagged `pii: true` return personal data
-    (CPF/CNPJ) into this conversation — call those only when the user asked for it.
+    Returns {status, url, body} (JSON parsed, text cut at 60k chars); a 3xx is not followed
+    and carries its absolute `location`. Problems come back as {error}. Entries flagged
+    `pii: true` return personal data (CPF/CNPJ): call them only when the user asked.
     """
     try:
         entry = get_catalog().get(api_id)
-    except KeyError as exc:
+    except (KeyError, CatalogError) as exc:
         return {"error": str(exc)}
 
-    if not entry.callable:
+    if not _callable_now(entry):
+        hint = entry.notes or entry.docs_url
+        if entry.status == "requires_contract" and entry.base_url is not None:
+            creds = auth_module.credentials_status(entry)
+            missing = [var for var, is_set in creds["env_vars"].items() if not is_set]
+            setup = f"Set {', '.join(missing)} to use your contract credentials." if missing else ""
+            reason = f"{creds['reason']}." if "reason" in creds else ""
+            hint = " ".join(filter(None, [reason, setup, hint]))
         return {
             "error": f"{entry.id} is not callable (status: {entry.status}).",
-            "hint": entry.notes or entry.docs_url,
+            "hint": hint,
         }
 
+    # Validate everything the caller controls before touching credentials, so a bad
+    # call never costs an OAuth2 token request.
+    method = method.upper()
+    if method not in ALLOWED_METHODS:
+        return {
+            "error": f"method {method!r} is not allowed.",
+            "allowed_methods": list(ALLOWED_METHODS),
+        }
+    if body is not None and method in ("GET", "HEAD", "DELETE", "OPTIONS"):
+        return {
+            "error": f"body is not supported with {method}; "
+            "use query for parameters, or POST if the API expects a payload."
+        }
     try:
+        request_headers, ignored = _caller_headers(entry, headers)
         url, params = _build_target(entry.base_url, path, query)
-    except ValueError as exc:
+        # Dry run: surfaces what httpx cannot encode (query, body) before any credential.
+        _client.build_request(method, url, params=params, json=body, headers=request_headers)
+    except (ValueError, httpx.InvalidURL) as exc:
         return {"error": str(exc)}
 
-    # Caller headers first, then auth: the managed credential always wins.
-    request_headers = {"Accept": "application/json"}
-    rejected = sorted(h for h in (headers or {}) if h.lower() in PROTECTED_HEADERS)
-    if headers:
-        request_headers.update(
-            {k: v for k, v in headers.items() if k.lower() not in PROTECTED_HEADERS}
-        )
+    # The managed credential goes last, so it always wins.
     try:
         request_headers.update(auth_module.build_headers(entry, _client))
     except auth_module.MissingCredentialsError as exc:
         return {"error": str(exc), "credentials": auth_module.credentials_status(entry)}
-
-    if body is not None and method.upper() in ("GET", "HEAD", "DELETE"):
-        return {
-            "error": f"body is not supported with {method.upper()}; "
-            "use query for parameters, or POST if the API expects a payload."
-        }
+    except auth_module.TokenError as exc:
+        return {"error": str(exc), "token_url": entry.auth_config.get("token_url")}
 
     try:
-        result = _send(method.upper(), url, params, body, request_headers)
+        result = _send(method, url, params, body, request_headers)
+    except httpx.LocalProtocolError as exc:
+        # h11 quotes the header it rejects, and that header can be the credential
+        message = "the HTTP library rejected the request as malformed."
+        return {"error": f"{type(exc).__name__}: {message}", "url": url}
     except httpx.HTTPError as exc:
         return {"error": f"{type(exc).__name__}: {exc}", "url": url}
+    except (httpx.InvalidURL, ValueError):  # UnicodeError is a ValueError too
+        # httpx builds the request a 3xx points to even though it is told not to follow it
+        return {"error": "upstream sent a malformed Location header", "url": url}
 
-    if rejected:
-        result["ignored_headers"] = rejected
+    if ignored:
+        result["ignored_headers"] = ignored
     return result
 
 
 @mcp.tool()
 def credentials_status(api_id: str | None = None) -> list[dict[str, Any]]:
     """Show which APIs have credentials configured. Without api_id, reports every
-    catalog entry that requires auth, so you can see what is ready to call."""
-    catalog = get_catalog()
+    catalog entry that requires auth, so you can see what is ready to call.
+
+    `ready` says whether the credential env vars are set; `callable` whether call_api
+    accepts the entry right now (a requires_contract entry, such as Serpro's, only does
+    once they are).
+    """
     try:
+        catalog = get_catalog()
         entries = (
             [catalog.get(api_id)]
             if api_id
             else [e for e in catalog.list() if e.auth != "none" and e.category != "conecta"]
         )
-    except KeyError as exc:
+    except (KeyError, CatalogError) as exc:
         return [{"error": str(exc)}]
-    return [{"id": e.id, "status": e.status, **auth_module.credentials_status(e)} for e in entries]
+    return [
+        {
+            "id": e.id,
+            "status": e.status,
+            **auth_module.credentials_status(e),
+            "callable": _callable_now(e),
+        }
+        for e in entries
+    ]
+
+
+def _callable_now(entry: ApiEntry) -> bool:
+    """Whether call_api accepts the entry.
+
+    ApiEntry.callable only knows the catalog: status available or unstable, with a base_url.
+    This adds the requires_contract entries (Serpro) whose credentials are in the
+    environment, because for them holding the contract means nothing more than that.
+    """
+    if entry.callable:
+        return True
+    return (
+        entry.status == "requires_contract"
+        and entry.base_url is not None
+        and bool(auth_module.credentials_status(entry)["ready"])
+    )
+
+
+def _caller_headers(
+    entry: ApiEntry, headers: dict[str, str] | None
+) -> tuple[httpx.Headers, list[str]]:
+    """Gateway default headers plus the caller's, minus the protected ones.
+
+    httpx.Headers compares names case-insensitively, so `Chave-Api-Dados` and
+    `CHAVE-API-DADOS` cannot both ride along next to the managed credential; `_` is read
+    as `-` too. Returns the headers and the sorted names that were ignored; a header
+    httpx or the wire would refuse raises ValueError.
+    """
+    merged = httpx.Headers({"Accept": "application/json", "Accept-Encoding": "identity"})
+    managed = (entry.auth_config.get("header") or "").lower().replace("_", "-")
+    ignored: list[str] = []
+    for name, value in (headers or {}).items():
+        if not HEADER_NAME_RE.fullmatch(name):
+            raise ValueError(f"header name {name!r} is not valid — it must be an HTTP token.")
+        canonical = name.lower().replace("_", "-")
+        if (
+            canonical in PROTECTED_HEADERS
+            or canonical.startswith("x-forwarded-")
+            or canonical == managed
+        ):
+            ignored.append(name)
+        elif auth_module.HEADER_VALUE_RE.fullmatch(value):
+            merged[name] = value
+        else:
+            raise ValueError(
+                f"header {name!r} has an invalid value — printable ASCII, no line breaks "
+                "and no whitespace at either end."
+            )
+    return merged, sorted(ignored)
+
+
+def _decoded(path: str) -> str | None:
+    """`path` percent-decoded until it stops changing, as a chain of proxies and servers may
+    do; None if it is still changing after three rounds (nothing legitimate is encoded that
+    deep)."""
+    for _ in range(3):
+        decoded = unquote(path)
+        if decoded == path:
+            return path
+        path = decoded
+    return None
+
+
+def _has_dot_segment(decoded: str) -> bool:
+    """True if the percent-decoded path has a '.' or '..' segment however a chain of proxies
+    and servers might read it: '\\' taken as '/', ';params' dropped from each segment."""
+    return any(
+        segment.split(";", 1)[0] in (".", "..") for segment in decoded.replace("\\", "/").split("/")
+    )
 
 
 def _build_target(
     base_url: str, path: str, query: dict[str, Any] | None
-) -> tuple[str, dict[str, Any]]:
+) -> tuple[str, httpx.QueryParams]:
     """Join path onto base_url, merging any embedded query string.
 
     httpx replaces (never merges) a URL's query when `params` is given, so a path
     like PTAX's "/CotacaoDolarDia(dataCotacao=@d)?@d='08-06-2026'" would silently
-    lose its parameter. Traversal is rejected by checking the normalized URL still
-    sits under the base prefix.
+    lose its parameter. The two are merged as httpx.QueryParams, which keeps repeated
+    keys (?uf=SP&uf=RJ); a key in `query` replaces the embedded one entirely.
+    Traversal is rejected by looking for dot segments under up to three decodings (a
+    proxy chain may decode more than once), then checking the normalized URL still sits
+    under the base prefix.
     """
     raw_path, _, embedded = path.partition("?")
-    if ".." in unquote(raw_path).split("/"):
+    if "#" in path:  # httpx cuts a fragment off, so nothing after it would be checked or sent
         raise ValueError(
-            f"path {path!r} contains '..' — pass a path relative to the API's base URL."
+            f"path {path!r} contains '#': a fragment is never sent. "
+            "Percent-encode it as %23 if it is meant literally."
+        )
+    decoded = _decoded(raw_path)
+    if decoded is None:
+        raise ValueError(f"path {path!r} stays percent-encoded after 3 decodings.")
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in decoded):
+        raise ValueError(f"path {path!r} contains control characters.")
+    if _has_dot_segment(decoded):
+        raise ValueError(
+            f"path {path!r} contains '..' or '.' segments — "
+            "pass a path relative to the API's base URL."
         )
     base = httpx.URL(base_url)
-    candidate = httpx.URL(str(base).rstrip("/") + "/" + raw_path.lstrip("/"))
+    try:
+        candidate = httpx.URL(str(base).rstrip("/") + "/" + raw_path.lstrip("/"))
+    except httpx.InvalidURL as exc:  # control characters, over-long paths: not a ValueError
+        raise ValueError(f"path is not a valid URL path: {exc}") from None
 
-    # Compare after percent-decoding *and* collapsing dot segments: %2e%2e reaches the
-    # remote server encoded, and some servers decode it back into a traversal.
+    # Second line of defence: compare after percent-decoding *and* collapsing dot
+    # segments. The comparison needs a segment boundary, or /api-de-dados-admin would
+    # pass for a base of /api-de-dados (an empty prefix accepts everything).
     prefix = base.path.rstrip("/")
     normalized = posixpath.normpath(unquote(candidate.path))
-    if candidate.host != base.host or not normalized.startswith(prefix or "/"):
+    if candidate.host != base.host or not (
+        normalized == prefix or normalized.startswith(prefix + "/")
+    ):
         raise ValueError(
             f"path {path!r} escapes the API's base URL ({base_url}); "
             "use a path relative to it, without '..' segments."
         )
 
-    params: dict[str, Any] = dict(httpx.QueryParams(embedded)) if embedded else {}
+    params = httpx.QueryParams(embedded)
     if query:
-        params.update(query)
+        params = params.merge(query)
     return str(candidate.copy_with(query=None)), params
 
 
 def _send(
-    method: str, url: str, params: dict[str, Any], body: Any, headers: dict[str, str]
+    method: str, url: str, params: httpx.QueryParams, body: Any, headers: httpx.Headers
 ) -> dict[str, Any]:
-    """Stream the response so an oversized payload is cut at the wire, not in memory."""
+    """Stream the response so an oversized payload is cut at the wire, not in memory.
+
+    Accepted risk: the cut counts decoded text, and `Accept-Encoding: identity` only helps
+    while the server honors it. One that compresses anyway can still inflate a small chunk
+    into megabytes before the cut; bounded decompression is left for a follow-up.
+    """
     with _client.stream(method, url, params=params, json=body, headers=headers) as resp:
         chunks: list[str] = []
         size = 0
-        for chunk in resp.iter_text():
-            chunks.append(chunk)
-            size += len(chunk)
-            if size > MAX_BODY_CHARS:
-                break
+        try:
+            for chunk in resp.iter_text():
+                chunks.append(chunk)
+                size += len(chunk)
+                if size > MAX_BODY_CHARS:
+                    break
+        except (LookupError, AssertionError, TypeError, UnicodeError):
+            # httpx takes any registered codec as a charset (hex, zlib, rot13) and then fails
+            charset = (resp.charset_encoding or "")[:40]
+            message = f"upstream response could not be decoded (charset={charset})"
+            return {"error": message, "status": resp.status_code}
         text = "".join(chunks)
         content_type = resp.headers.get("content-type")
         request_url = str(resp.request.url)
@@ -263,20 +471,27 @@ def _send(
             "truncated": True,
             "hint": "Response exceeded 60k chars — narrow it with query filters or pagination.",
         }
-    elif "json" in (content_type or ""):
+    elif text and "json" in (content_type or ""):  # an empty body (HEAD, 204) is not bad JSON
         try:
             parsed = json.loads(text)
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):  # bad syntax, too many digits, nested too deep
             parsed = {"text": text, "parse_error": "content-type said JSON but body did not parse"}
     else:
         parsed = text
 
-    return {
+    result = {
         "status": resp.status_code,
         "url": _redact(request_url),
         "content_type": content_type,
         "body": parsed,
     }
+    location = resp.headers.get("location")
+    if location and 300 <= resp.status_code < 400:
+        try:
+            result["location"] = _redact(str(resp.url.join(location)))
+        except (httpx.InvalidURL, ValueError):  # httpx only vets Location on 301/302/303/307/308
+            result["location"] = "<invalid URL>"
+    return result
 
 
 def _redact(url: str) -> str:
@@ -285,10 +500,10 @@ def _redact(url: str) -> str:
     parsed = httpx.URL(url)
     if not parsed.query:
         return url
-    safe = {
-        k: ("***" if any(h in k.lower() for h in SENSITIVE_PARAM_HINTS) else v)
-        for k, v in parsed.params.items()
-    }
+    safe = [
+        (k, "***" if any(h in k.lower() for h in SENSITIVE_PARAM_HINTS) else v)
+        for k, v in parsed.params.multi_items()
+    ]
     return str(parsed.copy_with(params=safe))
 
 
