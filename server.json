@@ -22,11 +22,61 @@
         {
           "name": "TRANSPARENCIA_API_KEY",
           "description": "API key for the Portal da Transparencia API",
+          "isRequired": false,
           "isSecret": true
         },
         {
           "name": "DATAJUD_API_KEY",
           "description": "API key for the CNJ DataJud API",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "DADOSGOV_API_KEY",
+          "description": "API key for the dados.gov.br portal API (free, generated in the user profile)",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "SERPRO_CPF_CLIENT_ID",
+          "description": "OAuth2 client ID for the Serpro CPF API (commercial contract)",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "SERPRO_CPF_CLIENT_SECRET",
+          "description": "OAuth2 client secret for the Serpro CPF API (commercial contract)",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "SERPRO_CNPJ_CLIENT_ID",
+          "description": "OAuth2 client ID for the Serpro CNPJ API (commercial contract)",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "SERPRO_CNPJ_CLIENT_SECRET",
+          "description": "OAuth2 client secret for the Serpro CNPJ API (commercial contract)",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "SERPRO_DATAVALID_CLIENT_ID",
+          "description": "OAuth2 client ID for the Serpro Datavalid API (commercial contract)",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "SERPRO_DATAVALID_CLIENT_SECRET",
+          "description": "OAuth2 client secret for the Serpro Datavalid API (commercial contract)",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "MEIAENTRADA_CODIGO_ACESSO",
+          "description": "Access code (codigoAcesso) for the CIE validator used for meia-entrada, issued to the venue or producer",
+          "isRequired": false,
           "isSecret": true
         }
       ]
