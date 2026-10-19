@@ -5,10 +5,10 @@
 <!-- mcp-name: io.github.thalisantunes/govbr-apis-mcp -->
 
 MCP server that turns Brazilian government APIs into Claude-callable tools through a
-**spec-driven gateway**: instead of one tool per endpoint (hundreds — would blow up
+**catalog-driven gateway**: instead of one tool per endpoint (hundreds — would blow up
 client context), five generic tools operate over a local YAML catalog of 116 APIs.
 
-"Spec-driven" holds for the entries that declare an `openapi_url`: today the Câmara dos
+Only the entries that declare an `openapi_url` have a spec to load: today the Câmara dos
 Deputados and the Portal da Transparência, 2 of the 116. For those, `describe_api` loads
 the OpenAPI spec on demand. Every other callable entry (see the "Callable today?" column
 below) is reached through `call_api` alone, using the endpoints in its description and
