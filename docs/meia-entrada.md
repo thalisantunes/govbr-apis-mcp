@@ -41,9 +41,10 @@ documental, não de recusa automática.
 ### Regras de decisão (`src/govbr_apis_mcp/cie.py`)
 
 - **Datas.** A entrada e as respostas (`dataExpiracao` do DNE, `validity` da FESN) passam
-  por um único leitor, que aceita `YYYY-MM-DD` (opcionalmente seguido de `T` ou espaço e a
-  hora), `YYYYMMDD` e `DD/MM/YYYY`, e só datas que existem no calendário. Qualquer outra
-  coisa é ilegível. As datas são comparadas como datas, nunca como texto: como string,
+  por um único leitor, que aceita `YYYY-MM-DD` (opcionalmente seguido de `T` ou espaço e um
+  horário válido, `HH:MM[:SS[.fff]]` com `Z` ou fuso opcional, que não é aplicado),
+  `YYYYMMDD` e `DD/MM/YYYY`, e só datas que existem no calendário. Qualquer outra coisa é
+  ilegível. As datas são comparadas como datas, nunca como texto: como string,
   `20260930` ordena depois de `2026-12-20`.
 - **Validade.** É conferida contra a data do evento, não a da compra, e vale até o fim do
   dia do vencimento. Sem data do evento, usa o dia de hoje em America/Sao_Paulo (depois das
@@ -52,14 +53,21 @@ documental, não de recusa automática.
   validade ausente ou ilegível; na FESN, resposta com `useCode` diferente do consultado ou
   data de nascimento informada que ela não devolveu; HTTP fora de 2xx; resposta truncada
   ou com JSON inválido.
-- **Não validado não é recusa.** Quando nenhum validador respondeu (erro de rede ou do
-  gateway, HTTP fora de 2xx, resposta truncada ou ilegível), a decisão sai com
-  `validated=false` e a POC com exit 3: o fluxo tenta de novo ou pede comprovação
-  documental, nunca nega só por isso. A exceção é o 404 da FESN, lido como "não
-  encontrada". Na consulta combinada só é "não elegível" se todas as bases responderam; com
-  uma delas fora do ar o resultado é "não validado".
-- **Código de uso.** Na FESN ele vai no path da URL, então só aceita 1 a 64 caracteres entre
-  letras, dígitos, `.`, `_` e `-` (e não apenas pontos).
+- **Não validado não é recusa.** Quando faltou resposta utilizável para decidir (erro de
+  rede ou do gateway, HTTP fora de 2xx, resposta truncada, ilegível ou sem veredito), a
+  decisão sai com `validated=false` e a POC com exit 3: o fluxo tenta de novo ou pede
+  comprovação documental, nunca nega só por isso. "Sem veredito" é o DNE sem `status`
+  booleano nem `codigoRetorno`, o DNE com `codigoRetorno` 5 (erro do nosso pedido, não da
+  carteirinha) e a FESN com 200 sem o `useCode` consultado. A exceção é o 404 da FESN com o
+  objeto de erro esperado (`name: "NotFoundError"`), lido como "não encontrada"; um 404 com
+  outro corpo é "não validado". Na consulta combinada só é "não elegível" se todas as bases
+  deram um veredito; com uma delas fora do ar ou sem resposta utilizável o resultado é
+  "não validado".
+- **Entrada.** Código de uso, data de nascimento e data do evento são validados antes de
+  qualquer chamada de rede, inclusive em `auto`, para que entrada inválida nunca descarte um
+  veredito já obtido. Na FESN o código vai no path da URL, então só aceita 1 a 64 caracteres
+  entre letras, dígitos, `.`, `_` e `-` (e não apenas pontos). Uma data de nascimento
+  informada e vazia é erro, não uma checagem pulada.
 - **Dado pessoal.** Numa decisão não elegível, `holder` fica vazio e `raw` só leva chaves
   não pessoais: `status`, `codigoRetorno`, `mensagem`/`message`, a validade e, quando nenhum
   validador respondeu, o diagnóstico do gateway. Nome, CPF, nascimento e foto só aparecem

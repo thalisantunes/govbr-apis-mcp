@@ -26,7 +26,13 @@ FESN_CARD = {
     "entity": "IFRS",
     "validity": "2027-03-31 23:59:59",
 }
-DNE_ARGS = ["--codigo-uso", "ABC123", "--nascimento", "1999-04-21", "--cnpj", "00.000.000/0001-91"]
+
+
+def dne_argv(codigo_uso="ABC123", nascimento="1999-04-21", cnpj="00.000.000/0001-91"):
+    return ["--codigo-uso", codigo_uso, "--nascimento", nascimento, "--cnpj", cnpj]
+
+
+DNE_ARGS = dne_argv()
 
 
 def reply(body, status=200):
@@ -133,25 +139,26 @@ def test_dne_without_credential_exits_2(poc, monkeypatch, capsys):
 
 
 @pytest.mark.parametrize(
-    "argv",
+    "argv,field",
     [
-        ["--provedor", "dne", "--codigo-uso", "ABC123", "--nascimento", "20261399", "--cnpj", "1"],
-        [
-            "--provedor",
-            "dne",
-            "--codigo-uso",
-            "ABC123",
-            "--nascimento",
-            "1999-04-21",
-            "--cnpj",
-            "1",
-        ],
-        ["--provedor", "fesn", "--codigo-uso", "AB/12"],
+        (["--provedor", "dne", *dne_argv(nascimento="20261399")], "dataNascimento"),
+        (["--provedor", "dne", *dne_argv(cnpj="123")], "cnpjPromotor"),
+        (["--provedor", "auto", *dne_argv(codigo_uso="AB/12")], "codigoUso"),
+        (["--provedor", "fesn", "--codigo-uso", "AB/12"], "codigoUso"),
+        (["--provedor", "fesn", "--codigo-uso", "AB12CD34", "--nascimento", ""], "dataNascimento"),
+        (
+            ["--provedor", "fesn", "--codigo-uso", "AB12CD34", "--data-evento", "2026-13-45"],
+            "dataEvento",
+        ),
     ],
 )
-def test_invalid_input_exits_2(poc, argv, capsys):
+def test_invalid_input_exits_2_names_the_field_and_never_reaches_the_gateway(
+    poc, monkeypatch, capsys, argv, field
+):
+    gateway(monkeypatch)  # neither base may be called
     assert poc.main(argv) == 2
-    assert "entrada inválida" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "entrada inválida" in err and field in err
 
 
 # --- --data-evento reaches every provider -------------------------------------------

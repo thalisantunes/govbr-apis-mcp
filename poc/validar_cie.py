@@ -7,13 +7,16 @@ Uso real (precisa de MEIAENTRADA_CODIGO_ACESSO e de uma CIE de verdade):
         --evento "Show X" --cnpj 00.000.000/0001-91
 
 Sem credencial nem carteirinha à mão, o modo demo roda a mesma validação (cie.check)
-com respostas gravadas da API real no lugar da chamada de rede:
+com respostas de exemplo no lugar da chamada de rede (as recusas foram gravadas da API
+real; a aprovação é sintética):
 
     python poc/validar_cie.py --demo
 
-Exit code: 0 elegível; 1 não elegível; 2 entrada inválida ou credencial ausente;
-3 não validado (nenhuma base respondeu: rede, erro HTTP, resposta truncada). O 3 nunca é
-recusa: tente de novo ou peça comprovação documental.
+Exit code: 0 elegível; 1 não elegível (os validadores responderam e a carteirinha não
+vale); 2 entrada inválida ou credencial ausente; 3 não validado (faltou resposta utilizável
+para decidir: rede ou gateway, HTTP fora de 2xx, resposta truncada, ilegível ou sem
+veredito; em auto, também quando uma base não encontrou a carteirinha e a outra falhou).
+O 3 nunca é recusa: tente de novo ou peça comprovação documental.
 """
 
 from __future__ import annotations

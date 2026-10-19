@@ -13,9 +13,11 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 
 O modo demo roda a mesma função `cie.check` da consulta real (monta o payload, confere o
 status HTTP e a validade, interpreta o `codigoRetorno`), mas no lugar da chamada de rede
-entrega respostas gravadas da API real: carteirinha válida, inexistente e payload fora do
-contrato. Gateway, credencial, rede e a base FESN **não** passam pelo demo. A data do
-evento é fixa (2026-12-20), para o resultado não depender do relógio.
+entrega respostas de exemplo no formato da API: carteirinha válida, inexistente e payload
+fora do contrato (este aparece como NAO VALIDADO). As duas recusas foram gravadas da API
+real em 2026-08-07; a aprovação é sintética e o HTTP 200 em volta de cada resposta é
+fabricado pelo demo. Gateway, credencial, rede e a base FESN **não** passam pelo demo. A
+data do evento é fixa (2026-12-20), para o resultado não depender do relógio.
 
 Com `--json`, a saída é um único documento JSON (um objeto por caso); o aviso do demo vai
 para o stderr.
@@ -48,11 +50,12 @@ a data do evento, não contra a da compra. Sem ele, usa o dia de hoje em America
 | Código | Significado | O que fazer |
 |---|---|---|
 | 0 | elegível | liberar a meia-entrada e conferir foto e documento na portaria |
-| 1 | não elegível: um validador respondeu e a carteirinha não vale (vencida para a data do evento, nascimento que não confere, não encontrada nas bases consultadas) | tratar como pendência documental, não como recusa automática |
+| 1 | não elegível: os validadores responderam e a carteirinha não vale. Vencida para a data do evento (ou com validade ausente ou ilegível), nascimento que não confere, FESN sem nascimento para conferir, FESN com 404 "não encontrada", DNE com documento não encontrado | tratar como pendência documental, não como recusa automática |
 | 2 | entrada inválida ou credencial ausente | corrigir a chamada: argumento faltando ou mal formado, ou `MEIAENTRADA_CODIGO_ACESSO` ausente com `--provedor dne` |
-| 3 | não validado: nenhum validador respondeu (erro de rede ou do gateway, HTTP fora de 2xx, resposta truncada ou ilegível) | tentar de novo; se persistir, pedir comprovação documental |
+| 3 | não validado: faltou resposta utilizável para decidir. Erro de rede ou do gateway, HTTP fora de 2xx, resposta truncada, ilegível ou sem veredito (inclui o `codigoRetorno` 5 do DNE, que é erro do nosso pedido) ou qualquer exceção inesperada. Em `auto`, também quando uma base não encontrou a carteirinha e a outra falhou | tentar de novo; se persistir, pedir comprovação documental |
 
-Com `--json` a saída serve direto para pipeline; o campo `validated` é `false` no exit 3.
+Com `--json` a saída serve direto para pipeline; o campo `validated` é `false` no exit 3
+(exceto numa exceção inesperada, que escreve só no stderr).
 As regras por trás desses códigos estão em [../docs/meia-entrada.md](../docs/meia-entrada.md).
 
 O `codigoUso` e a `dataNascimento` são exatamente os dois valores que a URL do QR code
@@ -102,12 +105,14 @@ validade e, se ninguém respondeu, o diagnóstico do gateway. Os dados do portad
 quando a carteirinha é aprovada, para a conferência na portaria.
 
 A FESN não valida expiração nem titularidade — devolve `validity` sem aplicá-la, e o
-código de uso sozinho libera a consulta. `interpret_fesn` faz as checagens por nós: exige
-que a resposta seja da carteirinha consultada (mesmo `useCode`), recusa carteirinha vencida
-para a data do evento ou com validade ilegível e, quando a data de nascimento é informada,
-confere contra a que veio no payload. O HTTP 404 é lido como "não encontrada" (a
-resposta esperada para código desconhecido, com um objeto de erro no corpo); qualquer outro
-status fora de 2xx significa "não validado".
+código de uso sozinho libera a consulta. `interpret_fesn` faz as checagens por nós: a
+resposta precisa trazer o `useCode` consultado (senão não há decisão: "não validado"),
+recusa carteirinha vencida para a data do evento ou com validade ilegível e, quando a data
+de nascimento é informada, confere contra a que veio no payload; sem nascimento na
+resposta, recusa, porque a titularidade não se confirma. O HTTP 404 só é lido como "não
+encontrada" quando o corpo é o objeto de erro esperado para código desconhecido
+(`{"name": "NotFoundError", ...}`); um 404 com outro corpo (página de proxy ou WAF, texto) e
+qualquer outro status fora de 2xx significam "não validado".
 
 Ainda assim a cobertura é parcial: DCEs, CAs e outras entidades estaduais emitem CIE
 legítima e nem todas têm API. **`não validou` significa `pendência documental`, nunca
