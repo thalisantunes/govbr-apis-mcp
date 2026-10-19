@@ -10,6 +10,13 @@ Quirks worth knowing (verified 2026-08-07 against the live endpoint):
 - `dataNascimento` must be YYYYMMDD — DDMMYYYY makes the server return HTTP 500.
 - codigoRetorno 5 means the request shape is wrong; 2 means the card does not exist.
   Confusing one for the other sends you debugging the wrong thing.
+
+Two rules hold for every issuer:
+- Fail closed: whatever a decision depends on (HTTP status, use code, expiry, birth date)
+  must be present and readable, otherwise the card is not approved.
+- "Not validated" is not "refused": when no validator answered (network, HTTP error,
+  truncated body) the decision has validated=False and the caller retries or asks for
+  documents; it never denies on that alone.
 """
 
 from __future__ import annotations
@@ -373,9 +380,9 @@ def check_fesn(
 
     response = caller(FESN_API_ID, f"{FESN_PATH}/{quote(code, safe='')}", method="GET")
     if response.get("status") == 404:
-        # FESN answers an unknown use code with a 404 and an error object ({"name":
-        # "NotFoundError"...}). That is its verdict on the card, unlike a 5xx; reading the
-        # error object as a student record once approved a card that does not exist.
+        # An unknown use code is expected to come back as a 404 with an error object
+        # ({"name": "NotFoundError"...}). That is FESN's verdict on the card, unlike a 5xx;
+        # reading such an object as a student record once approved a card that does not exist.
         return CieDecision(
             False, "carteirinha não encontrada na base FESN", {}, {"status": 404}, "fesn"
         )

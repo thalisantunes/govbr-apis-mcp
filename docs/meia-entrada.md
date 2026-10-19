@@ -28,10 +28,42 @@ Segunda emissora confirmada: **FESN** (`GET https://validade.fesn.org.br/api/stu
 sem auth e sem data de nascimento), descoberta quando uma carteirinha real do IFRS falhou
 no DNE. Contrato completamente diferente do DNE — cada emissora terá o seu.
 
+A FESN é **fonte de dado pessoal chamável sem credencial**: quem tiver um código de uso
+recebe nome, CPF, data de nascimento e foto do portador, e não há chave a proteger. O
+catálogo marca `fesn-cie-validador` com `pii: true`; use só quando o usuário pediu a
+consulta.
+
 Limite real: cobre a base DNE. A lei também permite emissão por DCEs, CAs e entidades
 estaduais, que mantêm validadores próprios sem API documentada. Um estudante com
 carteira legítima fora do DNE **falha** nessa consulta — o fluxo precisa de fallback
 documental, não de recusa automática.
+
+### Regras de decisão (`src/govbr_apis_mcp/cie.py`)
+
+- **Datas.** A entrada e as respostas (`dataExpiracao` do DNE, `validity` da FESN) passam
+  por um único leitor, que aceita `YYYY-MM-DD` (opcionalmente seguido de `T` ou espaço e a
+  hora), `YYYYMMDD` e `DD/MM/YYYY`, e só datas que existem no calendário. Qualquer outra
+  coisa é ilegível. As datas são comparadas como datas, nunca como texto: como string,
+  `20260930` ordena depois de `2026-12-20`.
+- **Validade.** É conferida contra a data do evento, não a da compra, e vale até o fim do
+  dia do vencimento. Sem data do evento, usa o dia de hoje em America/Sao_Paulo (depois das
+  21h em Brasília a data em UTC já é a do dia seguinte).
+- **Fail closed.** O que a decisão exige e não veio, ou não dá para ler, nunca aprova:
+  validade ausente ou ilegível; na FESN, resposta com `useCode` diferente do consultado ou
+  data de nascimento informada que ela não devolveu; HTTP fora de 2xx; resposta truncada
+  ou com JSON inválido.
+- **Não validado não é recusa.** Quando nenhum validador respondeu (erro de rede ou do
+  gateway, HTTP fora de 2xx, resposta truncada ou ilegível), a decisão sai com
+  `validated=false` e a POC com exit 3: o fluxo tenta de novo ou pede comprovação
+  documental, nunca nega só por isso. A exceção é o 404 da FESN, lido como "não
+  encontrada". Na consulta combinada só é "não elegível" se todas as bases responderam; com
+  uma delas fora do ar o resultado é "não validado".
+- **Código de uso.** Na FESN ele vai no path da URL, então só aceita 1 a 64 caracteres entre
+  letras, dígitos, `.`, `_` e `-` (e não apenas pontos).
+- **Dado pessoal.** Numa decisão não elegível, `holder` fica vazio e `raw` só leva chaves
+  não pessoais: `status`, `codigoRetorno`, `mensagem`/`message`, a validade e, quando nenhum
+  validador respondeu, o diagnóstico do gateway. Nome, CPF, nascimento e foto só aparecem
+  quando a carteirinha é aprovada.
 
 ## ID Jovem
 
@@ -41,9 +73,10 @@ de WAF — endpoint de backend não confirmado como API) e o app ID Jovem no flu
 "Sou empresário", com cadastro por CNPJ.
 
 Para integração sistêmica, o caminho é pleitear a API `conecta-id-jovem` à Secretaria
-Nacional da Juventude. Detalhe que vale registrar: das 95 APIs do Conecta, essa é a única
-cuja descrição oficial admite instituições **públicas e privadas** — a regra geral de
-"só órgão público" tem essa exceção.
+Nacional da Juventude. Detalhe que vale registrar: a descrição oficial dessa API admite
+instituições **públicas e privadas**, o que foge da regra geral de "só órgão público" do
+Conecta. Não é caso isolado — a descrição da RNDS também cita laboratórios privados —, então
+vale ler a descrição de cada API em vez de assumir a regra geral.
 
 ## PcD — não há rota
 
