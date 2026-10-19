@@ -121,6 +121,35 @@ def test_3xx_without_location_is_an_http_error():
         fetch_spec("demo", SPEC_URL, client)
 
 
+def test_a_client_that_follows_redirects_by_default_is_still_checked_hop_by_hop():
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(str(request.url))
+        if request.url.host == "api.demo.gov.br":
+            return redirect("https://evil.example.com/openapi.json")
+        return ok()
+
+    client = httpx.Client(follow_redirects=True, transport=httpx.MockTransport(handler))
+    with pytest.raises(ValueError, match="evil.example.com"):
+        fetch_spec("demo", SPEC_URL, client)
+    assert requested == [SPEC_URL]
+
+
+def test_a_spec_url_httpx_cannot_parse_is_a_value_error():
+    client, requested = make_client(lambda request: ok())
+    with pytest.raises(ValueError, match="invalid spec URL"):
+        fetch_spec("demo", "https://api.demo.gov.br:evil/openapi.json", client)
+    assert requested == []
+
+
+def test_a_location_httpx_cannot_parse_is_a_value_error():
+    client, requested = make_client(lambda request: redirect("https://api.demo.gov.br:evil/x"))
+    with pytest.raises(ValueError, match="location header"):
+        fetch_spec("demo", SPEC_URL, client)
+    assert requested == [SPEC_URL]
+
+
 # --- size cap -----------------------------------------------------------------------------
 
 
@@ -216,6 +245,37 @@ def test_non_openapi_documents_are_rejected_and_not_cached(body, cache_home):
     with pytest.raises(ValueError, match="not an OpenAPI document"):
         fetch_spec("demo", SPEC_URL, client)
     assert not list(cache_home.glob("*"))
+
+
+YAML_BOMB = """\
+openapi: 3.0.0
+l0: &l0 [x, x, x, x, x, x, x, x, x, x]
+l1: &l1 [*l0, *l0, *l0, *l0, *l0, *l0, *l0, *l0, *l0, *l0]
+l2: &l2 [*l1, *l1, *l1, *l1, *l1, *l1, *l1, *l1, *l1, *l1]
+l3: [*l2, *l2, *l2, *l2, *l2, *l2, *l2, *l2, *l2, *l2]
+"""
+
+
+def test_yaml_aliases_are_refused_before_anything_expands(cache_home):
+    """Nested anchors, each listing the previous one ten times, stay tiny on the wire and
+    multiply on every level once serialized: the size cap cannot catch them, so no aliases."""
+    client, _ = make_client(lambda request: httpx.Response(200, content=YAML_BOMB.encode()))
+    with pytest.raises(ValueError, match="YAML aliases are not supported"):
+        fetch_spec("demo", SPEC_URL, client)
+    assert not list(cache_home.glob("*"))
+
+
+@pytest.mark.parametrize(
+    ("body", "where"),
+    [
+        (b'{"openapi": ', r"line 1 column 13 \(char 12\)"),  # cut short: YAML fails too
+        (b"plain text", r"line 1 column 1 \(char 0\)"),  # YAML reads it, as a string
+    ],
+)
+def test_a_document_that_is_neither_json_nor_yaml_says_where_json_broke(body, where):
+    client, _ = make_client(lambda request: httpx.Response(200, content=body))
+    with pytest.raises(ValueError, match=rf"not an OpenAPI document.*{where}"):
+        fetch_spec("demo", SPEC_URL, client)
 
 
 # --- cache key ----------------------------------------------------------------------------
@@ -464,3 +524,36 @@ def test_a_property_called_properties_holds_a_schema_not_a_name_map():
             "properties": {"type": "object", "properties": {"example": {"type": "string"}}}
         },
     }
+
+
+def test_unresolvable_parameter_refs_are_kept_apart():
+    elsewhere = {"$ref": "other.yaml#/parameters/A"}
+    spec = {
+        "paths": {
+            "/x": {
+                "parameters": [elsewhere],
+                "get": {
+                    "parameters": [
+                        elsewhere,  # the same pointer again replaces it
+                        {"$ref": "other.yaml#/parameters/B"},
+                        {"name": "q", "in": "query"},
+                    ]
+                },
+            }
+        }
+    }
+    assert len(operation(spec, "/x", "get")["parameters"]) == 3
+
+
+def test_parameter_refs_to_something_other_than_an_object_are_left_alone():
+    spec = {
+        "paths": {
+            "/x": {
+                "get": {
+                    "parameters": [{"$ref": "#/components/nothing"}, {"$ref": "#/components/list"}]
+                }
+            }
+        },
+        "components": {"nothing": None, "list": [1, 2]},
+    }
+    assert len(operation(spec, "/x", "get")["parameters"]) == 2

@@ -209,6 +209,22 @@ def test_base_dir_reads_yml_too_and_duplicates_across_extensions_fail(tmp_path, 
         Catalog.load(base)
 
 
+def test_empty_extra_catalog_dir_variable_counts_as_unset(clean_env):
+    expected = {e.id for e in Catalog.load().list()}
+    clean_env.setenv("GOVBR_EXTRA_CATALOG_DIR", "")
+    assert {e.id for e in Catalog.load().list()} == expected
+
+
+@pytest.mark.parametrize("content", ["apis: []\n", "apis:\n", "apis: null\n", ""])
+def test_extra_catalog_files_without_entries_are_an_error(content, tmp_path, clean_env):
+    extra = tmp_path / "extra"
+    extra.mkdir()
+    (extra / "empty.yaml").write_text(content, encoding="utf-8")
+    clean_env.setenv("GOVBR_EXTRA_CATALOG_DIR", str(extra))
+    with pytest.raises(ValueError, match="no catalog entries"):
+        Catalog.load()
+
+
 REJECTED_ENTRIES = [
     # every URL must be https ...
     ({"base_url": "http://api.demo.gov.br/v1"}, "base_url must use https"),

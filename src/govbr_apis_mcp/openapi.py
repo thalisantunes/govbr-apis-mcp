@@ -63,39 +63,64 @@ def fetch_spec(api_id: str, openapi_url: str, client: httpx.Client) -> dict[str,
 def _download(api_id: str, url: str, client: httpx.Client) -> bytes:
     """GET a spec, following redirects by hand so that every hop is checked before it is
     requested, and reading at most MAX_SPEC_BYTES."""
-    current = httpx.URL(url)
+    try:
+        current = httpx.URL(url)
+    except httpx.InvalidURL as exc:
+        raise ValueError(f"Spec fetch for {api_id}: invalid spec URL {url!r} ({exc})") from None
     for _ in range(MAX_REDIRECTS + 1):
         if current.scheme != "https" or not host_allowed(str(current)):
             raise ValueError(
                 f"Spec fetch for {api_id} refused {current}: spec and redirect URLs "
                 "must be https on an allowlisted host"
             )
-        with client.stream("GET", current, follow_redirects=False) as resp:
-            if resp.next_request is None:
-                resp.raise_for_status()
-                body = bytearray()
-                for chunk in resp.iter_bytes():
-                    body += chunk
-                    if len(body) > MAX_SPEC_BYTES:
-                        raise ValueError(
-                            f"Spec fetch for {api_id}: spec too large (over {MAX_SPEC_BYTES} bytes)"
-                        )
-                return bytes(body)
-            current = resp.next_request.url
+        try:
+            with client.stream("GET", current, follow_redirects=False) as resp:
+                if resp.next_request is None:
+                    resp.raise_for_status()
+                    return _read_capped(api_id, resp)
+                current = resp.next_request.url
+        except httpx.RemoteProtocolError as exc:
+            if "location header" not in str(exc):  # only httpx refusing to parse a redirect
+                raise
+            raise ValueError(f"Spec fetch for {api_id}: {exc}") from None
     raise ValueError(f"Spec fetch for {api_id} followed more than {MAX_REDIRECTS} redirects")
+
+
+def _read_capped(api_id: str, resp: httpx.Response) -> bytes:
+    body = bytearray()
+    for chunk in resp.iter_bytes():
+        body += chunk
+        if len(body) > MAX_SPEC_BYTES:
+            raise ValueError(
+                f"Spec fetch for {api_id}: spec too large (over {MAX_SPEC_BYTES} bytes)"
+            )
+    return bytes(body)
+
+
+class _NoAliasLoader(yaml.SafeLoader):
+    """SafeLoader that refuses YAML aliases. Nested anchors, each listing the previous one
+    ten times, stay tiny on the wire and multiply on every level once the document is
+    serialized, so the size cap on the download cannot protect against them."""
+
+    def compose_node(self, parent, index):
+        if self.check_event(yaml.AliasEvent):
+            raise ValueError("YAML aliases are not supported in OpenAPI documents")
+        return super().compose_node(parent, index)
 
 
 def _parse_spec(body: bytes) -> dict[str, Any]:
     """Specs come as JSON or YAML, and servers rarely label them right: sniff the body."""
+    problem = "not an OpenAPI document"
     try:
         spec = json.loads(body)
-    except ValueError:  # JSONDecodeError and UnicodeDecodeError
+    except ValueError as exc:  # JSONDecodeError and UnicodeDecodeError
+        problem += f" (not JSON: {exc})"
         try:
-            spec = yaml.safe_load(body)
+            spec = yaml.load(body, Loader=_NoAliasLoader)
         except yaml.YAMLError:
             spec = None
     if not isinstance(spec, dict) or not ({"openapi", "swagger"} & spec.keys()):
-        raise ValueError("not an OpenAPI document")
+        raise ValueError(problem)
     return spec
 
 
@@ -170,7 +195,10 @@ def _merge_params(spec: dict[str, Any], inherited: Any, own: Any) -> list[dict[s
     merged: dict[tuple[Any, Any], dict[str, Any]] = {}
     for raw in (*(inherited or []), *(own or [])):
         param = _deref(spec, raw)
-        merged[(param.get("name"), param.get("in"))] = param
+        key = (param.get("name"), param.get("in"))
+        if key == (None, None):  # a pointer we could not follow: tell them apart by its text
+            key = (param.get("$ref"), None)
+        merged[key] = param
     return list(merged.values())
 
 
@@ -224,13 +252,15 @@ def _lookup_ref(spec: dict[str, Any], ref: str) -> Any:
 
 def _deref(spec: dict[str, Any], node: Any) -> Any:
     """Follow a node's own $ref (a parameter may point into components) without inlining
-    anything below it. A pointer that does not resolve leaves the node as it was."""
+    anything below it. A pointer that does not lead to an object leaves the node as it was."""
     ref = node.get("$ref") if isinstance(node, dict) else None
     if isinstance(ref, str):
         try:
-            return _lookup_ref(spec, ref)
+            target = _lookup_ref(spec, ref)
         except KeyError:
-            pass
+            return node
+        if isinstance(target, dict):
+            return target
     return node
 
 

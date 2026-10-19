@@ -179,6 +179,12 @@ class Catalog:
 
     @classmethod
     def load(cls, catalog_dir: str | Path | None = None) -> Catalog:
+        """Load the base catalog, then lay the operator's extra directory over it.
+
+        The base directory is `catalog_dir`, else GOVBR_CATALOG_DIR, else the packaged one.
+        GOVBR_EXTRA_CATALOG_DIR adds entries and overrides same-id ones; an empty value counts
+        as unset, while a path that is not a directory, or holds no entries, is an error.
+        """
         base_dir = Path(catalog_dir or os.environ.get("GOVBR_CATALOG_DIR") or DEFAULT_CATALOG_DIR)
         entries = cls._load_dir(base_dir)
         if not entries:
@@ -204,7 +210,7 @@ class Catalog:
         entries: dict[str, ApiEntry] = {}
         for path in sorted([*directory.glob("*.yaml"), *directory.glob("*.yml")]):
             data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-            for raw in data.get("apis", []):
+            for raw in data.get("apis") or []:
                 try:
                     entry = ApiEntry(**raw)
                 except TypeError as exc:
