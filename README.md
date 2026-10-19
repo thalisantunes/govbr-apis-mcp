@@ -90,7 +90,8 @@ Register in Claude Code (`.mcp.json` or `claude mcp add`):
 ```
 
 From PyPI: `uvx govbr-apis-mcp` (set `"command": "uvx"` and `"args": ["govbr-apis-mcp"]`
-in the entry above; no checkout needed).
+in the entry above; no checkout needed). Each release is published to PyPI and to the MCP
+Registry automatically (`publish.yml`).
 
 Or run it in a container. The server speaks stdio, so keep `-i`:
 
