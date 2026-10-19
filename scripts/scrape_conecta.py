@@ -5,15 +5,23 @@ The Conecta catalog page is static HTML with one <a class="api-card"> per API.
 All Conecta APIs require adhesion as a public-sector entity, so every entry is
 generated with status: requires_public_entity and no callable base_url yet.
 
+The output file is replaced only by a result the catalog would accept. A page that
+yields no cards, or a card whose id fails the catalog's id rule, aborts with exit
+status 1 and leaves the file untouched.
+
 Usage: python scripts/scrape_conecta.py [output.yaml]
+Run it where govbr_apis_mcp is importable (pip install -e .), so the id rule is shared.
 """
 
+import html
 import re
 import sys
 import urllib.request
 from pathlib import Path
 
 import yaml
+
+from govbr_apis_mcp.catalog import ID_RE
 
 CATALOG_URL = "https://www.gov.br/conecta/catalogo/"
 DEFAULT_OUT = Path(__file__).resolve().parents[1] / "src/govbr_apis_mcp/catalog_data/conecta.yaml"
@@ -29,28 +37,34 @@ TAG_RE = re.compile(r'<span class="tag \w+">(.*?)</span>')
 
 
 def clean(text: str) -> str:
-    text = re.sub(r"<[^>]+>", "", text)
+    text = html.unescape(re.sub(r"<[^>]+>", "", text))
     return re.sub(r"\s+", " ", text).strip()
 
 
 def main() -> None:
     out_path = Path(sys.argv[1] if len(sys.argv) > 1 else DEFAULT_OUT)
     with urllib.request.urlopen(CATALOG_URL, timeout=30) as resp:
-        html = resp.read().decode("utf-8")
+        page = resp.read().decode("utf-8")
 
     seen: set[str] = set()
     apis = []
-    for m in CARD_RE.finditer(html):
+    for m in CARD_RE.finditer(page):
         slug = m.group("url").rstrip("/").rsplit("/", 1)[-1]
         if slug in seen:
             continue
         seen.add(slug)
+        name = clean(m.group("title"))
         orgao = ORGAO_RE.search(m.group("rest"))
+        if not orgao:
+            print(
+                f"warning: card {name!r} has no orgao block; provider falls back to Conecta gov.br",
+                file=sys.stderr,
+            )
         tags = [clean(t).lower() for t in TAG_RE.findall(m.group("rest"))]
         apis.append(
             {
                 "id": f"conecta-{slug}",
-                "name": clean(m.group("title")),
+                "name": name,
                 "provider": clean(orgao.group(1)) if orgao else "Conecta gov.br",
                 "category": "conecta",
                 "status": "requires_public_entity",
@@ -65,6 +79,23 @@ def main() -> None:
                 ),
             }
         )
+
+    if not apis:
+        print(
+            f"error: no API cards found at {CATALOG_URL} (did the page layout change?); "
+            f"{out_path} was left untouched",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    invalid = [api["id"] for api in apis if not ID_RE.match(api["id"])]
+    if invalid:
+        print(
+            f"error: {len(invalid)} id(s) the catalog would reject "
+            f"(must match {ID_RE.pattern}): {', '.join(invalid)}; "
+            f"{out_path} was left untouched",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8") as f:
