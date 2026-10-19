@@ -1,7 +1,7 @@
 [project]
 name = "govbr-apis-mcp"
 version = "0.2.0"
-description = "MCP server exposing Brazilian government APIs (public, Serpro commercial and Conecta gov.br) through a spec-driven gateway"
+description = "MCP server: a catalog-driven gateway over Brazilian government APIs, loading OpenAPI specs on demand"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"

@@ -10,8 +10,9 @@ client context), five generic tools operate over a local YAML catalog of 116 API
 
 "Spec-driven" holds for the entries that declare an `openapi_url`: today the Câmara dos
 Deputados and the Portal da Transparência, 2 of the 116. For those, `describe_api` loads
-the OpenAPI spec on demand. Every other entry is reachable through `call_api` alone, using
-the endpoints in its description and `docs_url`.
+the OpenAPI spec on demand. Every other callable entry (see the "Callable today?" column
+below) is reached through `call_api` alone, using the endpoints in its description and
+`docs_url`.
 
 ## Catalog tiers
 
@@ -44,9 +45,10 @@ flow is already implemented (Serpro uses the same one).
     leaves the `base_url` prefix are rejected.
   - A query string embedded in `path` is merged with `query`; a key in `query` replaces the
     embedded one, and a list value repeats the key.
-  - Caller headers are matched case-insensitively, with `_` equal to `-`. Connection, proxy,
-    forwarding and method-override headers (the list is in `server.py`) are dropped and
-    reported in `ignored_headers`. The managed credential is applied last and always wins.
+  - Caller headers are matched case-insensitively, with `_` equal to `-`. `Authorization`,
+    `Proxy-Authorization`, `Host`, `Cookie` and `Accept-Encoding`, plus connection, proxy,
+    forwarding and method-override headers, are dropped and reported in `ignored_headers`
+    (the full list is in `server.py`). The managed credential is applied last and always wins.
   - Method, body, headers and path are validated before any OAuth2 token is requested, and
     invalid input comes back as `{"error": ...}`.
   - A `3xx` is not followed: the response carries its `location` (redacted, resolved
@@ -84,8 +86,8 @@ Register in Claude Code (`.mcp.json` or `claude mcp add`):
 }
 ```
 
-Once published on PyPI: `uvx govbr-apis-mcp` (set `"command": "uvx"` and
-`"args": ["govbr-apis-mcp"]` in the entry above; no checkout needed).
+From PyPI: `uvx govbr-apis-mcp` (set `"command": "uvx"` and `"args": ["govbr-apis-mcp"]`
+in the entry above; no checkout needed).
 
 Or run it in a container. The server speaks stdio, so keep `-i`:
 
@@ -99,9 +101,12 @@ All secrets come from env vars declared per entry in the catalog (`auth_config`)
 Nothing is stored in the repo. `.env.example` lists the variables; each entry's
 `signup_url` says where to get a key. `credentials_status` reports readiness.
 
-The server does not read `.env` files. Put the variables in the MCP client's `env` block
-(as in the example above), pass them to a container with `docker run --env-file`, or
-export them in the shell that launches the client (`direnv` works well for that).
+The server does not read `.env` files, and MCP clients start it with a minimal environment,
+so an `export` in your shell may never reach it. Put the variables in the client's `env`
+block (the example above, or `claude mcp add -e KEY=value`). For a container, copy
+`.env.example` to a git-ignored file such as `.env.local`, fill in the copy and pass it
+with `docker run --env-file .env.local`. Never put real values in `.env.example`: it is
+versioned.
 
 Values are stripped of surrounding whitespace and must be printable ASCII; otherwise the
 call fails with `credential in <VAR> contains invalid characters`, without echoing the
@@ -118,8 +123,9 @@ Add an entry to a YAML file in `src/govbr_apis_mcp/catalog_data/`. The directory
 data, so the wheel, `uvx` and the Docker image all carry the catalog. Minimum fields:
 `id`, `name`, `provider`, `category`, `status`, `auth`. Add `openapi_url` when the API
 publishes a spec — `describe_api` then works with zero code. Regenerate the Conecta
-tier with `.venv/bin/python scripts/scrape_conecta.py` (it leaves the file alone when the
-page yields no APIs or an id the catalog would reject).
+tier with `.venv/bin/python scripts/scrape_conecta.py`. It leaves the file alone when the
+page yields no APIs, an id the catalog would reject, or fewer than half the current
+entries (`--force` overrides only the last check).
 
 Entries are validated on load: ids must be filename-safe, URLs must be `https` on an
 allowlisted host (`*.gov.br`, `*.leg.br`, `*.jus.br` plus a few named hosts), and a hostname
@@ -158,9 +164,11 @@ loads the catalog from a clean install.
   sends `Accept-Encoding: identity`, so the 60,000-character cut is made on the streamed body.
 - Spec fetches follow redirects only by hand: at most 5 hops, and every URL (the first
   and each `Location`) must be `https` on an allowlisted host before it is requested.
-  The body is capped at 5 MiB, JSON and YAML are accepted (YAML with anchors, aliases or
-  merge keys is refused), and the document must carry `openapi` or `swagger`.
-- `httpx` and `httpcore` log at WARNING, so no URL with a query string reaches stderr.
+  The body is capped at 5 MiB, JSON and YAML are accepted (YAML with aliases, including
+  merge keys that rely on them, is refused), and the document must carry `openapi` or
+  `swagger`.
+- The `httpx` and `httpcore` loggers stay at WARNING, so httpx logs no request URL (query
+  string included).
 - Entries flagged `pii: true` return personal data (CPF, name, photo) into the client
   transcript. Today: `meiaentrada-cie-validador`, `fesn-cie-validador` (callable without
   any credential: whoever holds a use code gets the holder's data) and the three Serpro

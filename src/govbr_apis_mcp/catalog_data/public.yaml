@@ -155,8 +155,8 @@ apis:
       Marcada unstable: não respondeu na verificação de 2026-08-07; disponibilidade oscila.
     tags: [meteorologia, clima, estacoes]
     notes: >-
-      O portal do INMET não publica mais a página do manual da API (a anterior responde
-      404); docs_url aponta para a raiz do portal.
+      Verificado em 2026-10-19: o portal do INMET não lista manual nem página da API;
+      docs_url aponta para a raiz do portal.
 
   - id: dados-gov-br
     name: dados.gov.br — API do Portal

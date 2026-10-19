@@ -1,9 +1,7 @@
 # Changelog
 
-All notable changes to this project are documented in this file.
-
-The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
-project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+All notable changes to this project are documented in this file. Versions follow
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.2.0] - 2026-10-19
 
@@ -17,8 +15,8 @@ checks now fail closed.
 - Package data also covers `*.yml` catalog files.
 - New CI runs ruff, the tests on Python 3.11 to 3.14, and a wheel smoke test. The smoke
   test installs only the wheel and loads the catalog from outside the checkout.
-- Publishing is gated on lint, format, tests and the same wheel smoke test. It runs only
-  for a release or from `main`.
+- Publishing is gated on lint, format, tests and a wheel smoke test. It runs only for a
+  release or from `main`.
 - `twine check --strict` runs in CI and in the publish workflow.
 - The Docker image copies only what the build needs and runs as an unprivileged user.
 - License metadata follows PEP 639 (`License-Expression: MIT`).
@@ -29,8 +27,10 @@ checks now fail closed.
 
 - `call_api` accepts GET, HEAD, POST, PUT, PATCH, DELETE and OPTIONS. Any other method
   returns an error with `allowed_methods`.
-- Caller headers are compared case-insensitively, with `_` equal to `-`. Connection, proxy,
-  forwarding and method-override headers are dropped and listed in `ignored_headers`.
+- Caller headers are compared case-insensitively, with `_` equal to `-`. `Authorization`,
+  `Proxy-Authorization`, `Host`, `Cookie` and `Accept-Encoding`, plus connection, proxy,
+  forwarding and method-override headers, are dropped and listed in `ignored_headers`.
+  The full list is in `server.py`.
 - The header of the managed credential is blocked for callers too, and the credential is
   applied last, so it always wins.
 - `Accept-Encoding: identity` is fixed, so the 60,000-character cut is made on the
@@ -52,14 +52,15 @@ checks now fail closed.
 - `credentials_status` reports `callable`. Serpro entries are callable once their
   `SERPRO_*` variables are set.
 - `serverInfo.version` and the `User-Agent` come from `__version__`.
-- `httpx` and `httpcore` log at WARNING, so no URL with a query string reaches stderr.
+- The `httpx` and `httpcore` loggers stay at WARNING, so httpx logs no request URL (query
+  string included).
 
 ### Spec fetch and catalog
 
 - `describe_api` follows redirects by hand, for at most 5 hops. Each URL, the first and
   every `Location`, must be `https` on an allowlisted host before it is requested.
 - Spec bodies are capped at 5 MiB. A spec can be JSON or YAML and must carry `openapi` or
-  `swagger`. YAML with anchors, aliases or merge keys is refused.
+  `swagger`. YAML with aliases (including merge keys that rely on them) is refused.
 - The spec cache file name derives from `sha256(api_id + "\n" + openapi_url)`, so changing
   a URL never serves an old spec.
 - `describe_api` reads Swagger 2.0 (`type` parameters, response `schema`, `in: body`) and
@@ -94,9 +95,11 @@ checks now fail closed.
 
 ### Docs and data
 
-- The README says that 2 of the 116 entries have an OpenAPI spec. It documents the gateway
-  rules, the spec fetch limits, the catalog layout, the credential rules and the `uvx` and
-  Docker installs.
+- Documented that only the entries that declare an `openapi_url` (2 of the 116) load a
+  spec, plus the gateway rules, the spec fetch limits, the catalog layout, the credential
+  rules and the `uvx` and Docker installs.
+- The package, registry and module descriptions call the gateway catalog-driven and say it
+  loads OpenAPI specs on demand, instead of calling it spec-driven.
 - `.env.example` says the server does not read `.env` files.
 - `docs/meia-entrada.md` and `poc/README.md` document the eligibility rules, the exit codes
   and FESN as a source of personal data.
@@ -104,8 +107,10 @@ checks now fail closed.
   BCB SGS, which pointed at the page of a single series.
 - The FESN entry describes the full verdict rules. The ID Jovem note no longer calls it
   the only Conecta API open to private institutions.
-- The Conecta scraper never overwrites the catalog with an empty result. It validates every
-  id, unescapes HTML entities and warns about a card with no organ block.
+- The Conecta scraper writes its output atomically. It never replaces the catalog with an
+  empty result, an invalid id or fewer than half the current entries (`--force` skips only
+  the last check). It also unescapes HTML entities and warns about a card with no agency
+  (órgão) block.
 
 ## [0.1.0] - 2026-09-10
 

@@ -59,8 +59,10 @@ apis:
       aplicada, e o código de uso sozinho libera a consulta. A decisão é nossa, em
       `cie.interpret_fesn`: exige o `useCode` consultado, confere a validade contra a
       data do evento e, se o nascimento foi informado, compara com `birth` (sem
-      nascimento na resposta, recusa). Só o 404 com o objeto de erro esperado vale
-      como "não encontrada"; outro 404 ou qualquer status fora de 2xx é "não validado".
+      nascimento na resposta, recusa). Essa conferência pega erro de digitação, não
+      fraude: a FESN devolve `birth` sem autenticação, então quem tem o código de uso lê
+      a data e a digita de volta. Só o 404 com o objeto de erro esperado vale como
+      "não encontrada"; outro 404 ou qualquer status fora de 2xx é "não validado".
 
   - id: idjovem-validacao
     name: ID Jovem — validação de carteira
@@ -115,7 +117,6 @@ apis:
       dados-gov-br para buscar o conjunto "Sistema e-MEC"). Nunca contém dados de aluno.
     tags: [educacao, ies, estudante, validacao-indireta]
     notes: >-
-      emec.mec.gov.br e dadosabertos.mec.gov.br respondem 403 a cliente não-browser: o
-      docs_url abre normalmente no navegador, mas um link-check automático recebe 403
-      (esperado, não é link quebrado).
+      Verificado em 2026-10-19: emec.mec.gov.br e dadosabertos.mec.gov.br respondem 403 a
+      cliente não-browser.
       Existe scraper não-oficial (github.com/pavanad/emec-api), fora do escopo deste MCP.
