@@ -80,7 +80,10 @@ def test_demo_json_is_a_single_valid_document():
     cases = json.loads(result.stdout)  # the whole stdout, not just its first object
     assert list(cases) == ["aprovado", "inexistente_ou_data_errada", "payload_errado"]
     assert cases["aprovado"]["eligible"] is True and cases["aprovado"]["validated"] is True
+    assert cases["inexistente_ou_data_errada"]["validated"] is True  # a verdict: not found
+    # code 5 is our payload out of contract: no verdict on the card, so not "not eligible"
     assert cases["payload_errado"]["eligible"] is False
+    assert cases["payload_errado"]["validated"] is False
 
 
 def test_demo_text_mode_runs_offline_and_exits_zero():
@@ -88,6 +91,7 @@ def test_demo_text_mode_runs_offline_and_exits_zero():
     assert result.returncode == 0, result.stderr
     assert "=== aprovado: ELEGIVEL ===" in result.stdout
     assert "=== inexistente_ou_data_errada: NAO ELEGIVEL ===" in result.stdout
+    assert "=== payload_errado: NAO VALIDADO ===" in result.stdout
 
 
 def test_demo_never_reads_the_clock(poc, monkeypatch):
@@ -188,6 +192,8 @@ FESN_UNKNOWN = reply({"name": "NotFoundError"}, 404)
         ({"error": "ConnectError: boom"}, 3),
         (reply("Bad Gateway", 502), 3),
         (reply({"text": "x", "truncated": True}), 3),
+        (reply({"status": False, "codigoRetorno": "5"}), 3),  # our payload out of contract
+        (reply({}), 3),  # a 200 that says nothing
     ],
 )
 def test_dne_exit_codes(poc, monkeypatch, dne, expected):
@@ -202,12 +208,26 @@ def test_dne_exit_codes(poc, monkeypatch, dne, expected):
         (NOT_FOUND, FESN_UNKNOWN, 1),  # asked everywhere: documents, not a verdict of fraud
         ({"error": "ConnectError: boom"}, FESN_UNKNOWN, 3),  # DNE unreachable: card may be there
         (NOT_FOUND, reply("Bad Gateway", 502), 3),  # FESN unreachable
+        (NOT_FOUND, reply("<html>WAF</html>", 404), 3),  # a 404 that is not FESN's error object
+        (NOT_FOUND, reply({"name": "NotFoundError"}), 3),  # a 200 without the card's useCode
     ],
 )
 def test_auto_exit_codes(poc, monkeypatch, dne, fesn, expected):
     gateway(monkeypatch, dne=dne, fesn=fesn)
     argv = ["--provedor", "auto", "--data-evento", "2026-12-20", "--nascimento", "1990-01-01"]
     assert poc.main([*argv, "--codigo-uso", "AB12CD34", "--cnpj", "1" * 14]) == expected
+
+
+def test_a_crash_is_not_a_verdict_it_exits_3_with_the_cause_on_stderr(poc, monkeypatch, capsys):
+    def boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(server, "call_api", boom)
+    for provider in ("dne", "auto"):
+        assert poc.main(["--provedor", provider, *DNE_ARGS]) == 3
+        captured = capsys.readouterr()
+        assert "falha inesperada (RuntimeError): boom" in captured.err
+        assert captured.out == ""
 
 
 def test_not_validated_is_labelled_and_serialised_as_such(poc, monkeypatch, capsys):

@@ -168,6 +168,9 @@ def main(argv: list[str] | None = None) -> int:
     except InvalidInput as exc:
         print(f"entrada inválida: {exc}", file=sys.stderr)
         return 2
+    except Exception as exc:  # noqa: BLE001 — a crash is not a verdict on the card
+        print(f"falha inesperada ({type(exc).__name__}): {exc}", file=sys.stderr)
+        return 3
 
     if args.json:
         print(json.dumps(decision.as_dict(), ensure_ascii=False, indent=2))

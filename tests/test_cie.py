@@ -14,6 +14,7 @@ from govbr_apis_mcp.cie import (
     interpret,
     interpret_fesn,
     normalize_date,
+    parse_date,
     today_br,
 )
 
@@ -166,9 +167,9 @@ def test_fesn_rejects_expired_card():
     assert not d.eligible and "vence em" in d.reason
 
 
-def test_fesn_unknown_card():
+def test_fesn_empty_body_has_no_verdict():
     d = interpret_fesn({}, None, codigo_uso=CODE)
-    assert not d.eligible and d.validated and "não encontrada" in d.reason
+    assert not d.eligible and not d.validated and "sem decisão" in d.reason
 
 
 def test_check_any_falls_back_to_fesn(monkeypatch):
@@ -289,6 +290,9 @@ VALID_THROUGH_EVENT = [
     "31/03/2027",
     "2027-03-31T23:59:59",
     "2027-03-31 23:59:59",
+    "2027-03-31 23:59",
+    "2027-03-31T23:59:59.123Z",
+    "2027-03-31T23:59:59-03:00",
 ]
 
 
@@ -325,9 +329,22 @@ def test_card_is_valid_through_the_event_day_itself():
     ).eligible
 
 
-@pytest.mark.parametrize(
-    "expiry", [None, "", "   ", "amanhã", "2027-13-01", "31-03-2027", "2027-03-31x", "2027-02-30"]
-)
+UNREADABLE_DATES = [
+    None,
+    "",
+    "   ",
+    "amanhã",
+    "2027-13-01",
+    "31-03-2027",
+    "2027-03-31x",
+    "2027-02-30",
+    "2027-03-31 9x",
+    "2027-03-31T99:99",
+    "2027-03-31 23:59:59 extra",
+]
+
+
+@pytest.mark.parametrize("expiry", UNREADABLE_DATES)
 def test_dne_missing_or_unreadable_expiry_fails_closed(expiry):
     payload = {"status": True, "nome": "X", "cpf": "123"}
     if expiry is not None:
@@ -336,9 +353,7 @@ def test_dne_missing_or_unreadable_expiry_fails_closed(expiry):
     assert not d.eligible and "validade não informada/ilegível" in d.reason and d.holder == {}
 
 
-@pytest.mark.parametrize(
-    "expiry", [None, "", "   ", "amanhã", "2027-13-01", "31-03-2027", "2027-03-31x", "2027-02-30"]
-)
+@pytest.mark.parametrize("expiry", UNREADABLE_DATES)
 def test_fesn_missing_or_unreadable_validity_fails_closed(expiry):
     payload = {k: v for k, v in FESN_OK.items() if k != "validity"}
     if expiry is not None:
@@ -460,7 +475,7 @@ def test_check_any_still_approves_via_fesn_when_dne_is_unreachable():
 def test_fesn_200_with_an_error_object_is_not_a_card():
     """`name` is the error class in {"name": "NotFoundError"}: it must not read as a holder."""
     d = call_fesn(reply({"name": "NotFoundError", "message": "no such code"}))
-    assert not d.eligible and d.validated and "não encontrada" in d.reason
+    assert not d.eligible and not d.validated and "sem decisão" in d.reason
 
 
 def test_fesn_200_without_validity_is_refused():
@@ -471,7 +486,7 @@ def test_fesn_200_without_validity_is_refused():
 
 def test_fesn_200_with_a_different_use_code_is_refused_without_echoing_it():
     d = call_fesn(reply({**FESN_OK, "useCode": "ZZ99ZZ99"}))
-    assert not d.eligible and d.holder == {} and "não encontrada" in d.reason
+    assert not d.eligible and not d.validated and d.holder == {} and "sem decisão" in d.reason
     assert "ZZ99ZZ99" not in d.reason  # another person's card code
 
 
@@ -648,7 +663,7 @@ def test_fesn_unreadable_birth_date_keeps_no_personal_data():
 
 def test_fesn_record_of_another_card_keeps_no_personal_data():
     d = interpret_fesn(FESN_OK, None, codigo_uso="ZZ99ZZ99")
-    assert not d.eligible and "não encontrada" in d.reason
+    assert not d.eligible and "sem decisão" in d.reason
     assert_no_personal_data(d)
 
 
@@ -695,3 +710,151 @@ def test_check_any_combined_decision_keeps_no_personal_data():
     d = check_any("AB12CD34", "1990-01-02", "e", "00000000000191", caller=caller)
     assert not d.eligible and d.provider is None
     assert_no_personal_data(d)
+
+
+# --- the time after a date must be a real time, not just "something" ----------------
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "2027-03-31 23:59:59",
+        "2027-03-31T23:59",
+        "2027-03-31T23:59:59.123Z",
+        "2027-03-31T23:59:59-03:00",
+        "2027-03-31 00:00:00+0000",
+        " 2027-03-31 ",
+    ],
+)
+def test_parse_date_accepts_a_real_time_after_the_date(value):
+    assert parse_date(value) == date(2027, 3, 31)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "2027-03-31 9x",
+        "2027-03-31T99:99",
+        "2027-03-31T24:00",
+        "2027-03-31T23:60",
+        "2027-03-31T",
+        "2027-03-31 23:59:59 extra",
+        "2027-03-31T10:00+99:99",
+    ],
+)
+def test_parse_date_rejects_anything_but_a_real_time_after_the_date(value):
+    assert parse_date(value) is None
+
+
+# --- FESN 404 is "not found" only with the error object it is expected to carry ------
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "<html>502 Bad Gateway</html>",
+        "Not Found",
+        None,
+        {"message": "no such code"},
+        {"name": "SomethingElse"},
+        {"text": "x", "truncated": True},
+    ],
+)
+def test_fesn_404_without_the_expected_error_object_is_not_validated(body):
+    """A proxy or WAF page can answer 404 too; it says nothing about the card."""
+    d = call_fesn(reply(body, 404))
+    assert not d.eligible and not d.validated and "status: 404" in d.reason
+
+
+# --- no verdict on the card = not validated, never "not eligible" ----------------------
+
+
+def test_dne_code_5_is_our_request_out_of_contract_not_a_verdict():
+    d = interpret({"status": False, "codigoRetorno": "5", "mensagem": "parâmetros inválidos"})
+    assert not d.eligible and not d.validated
+    assert "parâmetros inválidos" in d.reason and "sem decisão" in d.reason
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"nome": None},
+        {"mensagem": "x"},
+        {"status": None, "codigoRetorno": None},
+        {"status": "talvez"},
+        {"codigoRetorno": ""},
+    ],
+)
+def test_dne_payload_without_status_or_return_code_is_not_a_verdict(payload):
+    d = interpret(payload)
+    assert not d.eligible and not d.validated and "sem veredito" in d.reason
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"status": False},
+        {"status": "false"},
+        {"codigoRetorno": "2"},
+        {"status": None, "codigoRetorno": 2},
+        {"status": False, "codigoRetorno": "99", "mensagem": "algo novo"},
+    ],
+)
+def test_dne_payload_with_a_status_or_return_code_is_a_verdict(payload):
+    d = interpret(payload)
+    assert not d.eligible and d.validated
+
+
+def test_dne_200_without_a_verdict_is_not_validated():
+    d = call_dne(reply({}))
+    assert not d.eligible and not d.validated and d.provider == "dne"
+
+
+def test_dne_code_5_through_check_is_not_validated():
+    d = call_dne(reply({"status": False, "codigoRetorno": "5"}))
+    assert not d.eligible and not d.validated and d.provider == "dne"
+
+
+def test_fesn_200_with_an_empty_object_is_not_validated():
+    d = call_fesn(reply({}))
+    assert not d.eligible and not d.validated
+
+
+def test_check_any_with_dne_code_5_is_not_validated():
+    caller = dne_and_fesn(reply({"status": False, "codigoRetorno": "5"}), FESN_NOT_FOUND)
+    d = check_any("X", "20000115", "e", "00000000000191", caller=caller)
+    assert not d.eligible and not d.validated and d.provider is None
+
+
+# --- input is validated before the first network call, whichever base needs it -------
+
+
+def never_called(*args, **kwargs):
+    raise AssertionError("invalid input must be rejected before any network call")
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"data_nascimento": "20261399"}, {"data_nascimento": ""}, {"data_evento": "2026-13-45"}],
+)
+def test_fesn_validates_birth_and_event_dates_before_the_call(kwargs):
+    with pytest.raises(InvalidInput):
+        check_fesn(CODE, caller=never_called, **kwargs)
+
+
+@pytest.mark.parametrize("codigo", ["AB/12", "", "A" * 65])
+def test_check_any_validates_the_fesn_code_before_asking_dne(codigo):
+    """A late InvalidInput from the FESN leg used to throw away the DNE verdict."""
+    with pytest.raises(InvalidInput, match="codigoUso"):
+        check_any(codigo, "20000115", "e", "00000000000191", caller=never_called)
+
+
+def test_check_any_validates_the_dne_fields_before_the_first_call():
+    with pytest.raises(InvalidInput, match="cnpjPromotor"):
+        check_any(CODE, "20000115", "e", "123", caller=never_called)
+
+
+def test_fesn_empty_birth_date_is_invalid_input_not_a_skipped_check():
+    with pytest.raises(InvalidInput, match="dataNascimento"):
+        interpret_fesn(FESN_OK, "", codigo_uso=CODE)
