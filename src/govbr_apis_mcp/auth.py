@@ -36,7 +36,10 @@ class TokenError(Exception):
 
 
 _token_cache: dict[str, tuple[str, float]] = {}
-_token_lock = threading.Lock()  # the SDK runs sync tools in a thread pool
+# The SDK runs sync tools in a thread pool. One lock per API serializes its token requests
+# (single flight) without making any other API wait; the guard protects the dict of locks.
+_token_locks: dict[str, threading.Lock] = {}
+_token_locks_guard = threading.Lock()
 
 
 def _secret(var: str | None) -> str:
@@ -84,12 +87,24 @@ def _api_key_headers(entry: ApiEntry) -> dict[str, str]:
     return {entry.auth_config["header"]: value}
 
 
+def _token_lock_for(entry_id: str) -> threading.Lock:
+    with _token_locks_guard:
+        return _token_locks.setdefault(entry_id, threading.Lock())
+
+
+def _cached_token(entry_id: str) -> str | None:
+    cached = _token_cache.get(entry_id)
+    return cached[0] if cached and cached[1] > time.monotonic() else None
+
+
 def _oauth2_token(entry: ApiEntry, client: httpx.Client) -> str:
-    # One lock around check, request and store: concurrent callers share a single token request.
-    with _token_lock:
-        cached = _token_cache.get(entry.id)
-        if cached and cached[1] > time.monotonic():
-            return cached[0]
+    token = _cached_token(entry.id)  # no lock: a cached token never waits on a fetch
+    if token:
+        return token
+    with _token_lock_for(entry.id):
+        token = _cached_token(entry.id)  # a caller ahead of us may have fetched it meanwhile
+        if token:
+            return token
         token, ttl = _request_token(entry, client)
         if ttl > 60:  # short-lived tokens are not cached — serving an expired one is worse
             _token_cache[entry.id] = (token, time.monotonic() + ttl - 30)
@@ -97,7 +112,8 @@ def _oauth2_token(entry: ApiEntry, client: httpx.Client) -> str:
 
 
 def _request_token(entry: ApiEntry, client: httpx.Client) -> tuple[str, int]:
-    """Fetch a token; returns it with its lifetime in seconds (0 when the endpoint gives none)."""
+    """Fetch a token; returns it with its lifetime in seconds: 300 if the endpoint gives none,
+    0 if what it gives is unusable (the token is then used once and not cached)."""
     cfg = entry.auth_config
     id_var, secret_var = cfg.get("client_id_env"), cfg.get("client_secret_env")
     if not id_var or not secret_var or not cfg.get("token_url"):
@@ -136,7 +152,7 @@ def _request_token(entry: ApiEntry, client: httpx.Client) -> tuple[str, int]:
         raise TokenError(
             f"{entry.id}: client credentials contain characters that cannot be encoded"
         ) from None
-    except (ValueError, KeyError, TypeError):
+    except (ValueError, KeyError, TypeError, RecursionError):  # RecursionError: nested JSON
         raise TokenError(f"{entry.id}: token endpoint returned no access_token") from None
     token = token.strip()
     if not HEADER_VALUE_RE.fullmatch(token):

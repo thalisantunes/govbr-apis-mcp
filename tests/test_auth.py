@@ -4,6 +4,7 @@ import base64
 import dataclasses
 import threading
 import time
+import types
 
 import httpx
 import pytest
@@ -21,6 +22,39 @@ def entry(monkeypatch):
     monkeypatch.setenv("SERPRO_CNPJ_CLIENT_SECRET", "the-secret")
     monkeypatch.setattr(auth, "_token_cache", {})
     return Catalog.load().get("serpro-consulta-cnpj")
+
+
+@pytest.fixture
+def cpf_entry(monkeypatch):
+    """serpro-consulta-cpf: a second OAuth2 API, with credentials of its own."""
+    monkeypatch.setenv("SERPRO_CPF_CLIENT_ID", "cpf-id")
+    monkeypatch.setenv("SERPRO_CPF_CLIENT_SECRET", "cpf-secret")
+    return Catalog.load().get("serpro-consulta-cpf")
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    """A hand-wound monotonic clock for the token cache: age every token with `clock.now += n`."""
+    clock = types.SimpleNamespace(now=1000.0)
+    monkeypatch.setattr(auth, "time", types.SimpleNamespace(monotonic=lambda: clock.now))
+    return clock
+
+
+def client_id_of(request):
+    basic = request.headers["authorization"].removeprefix("Basic ")
+    return base64.b64decode(basic).decode().split(":")[0]
+
+
+def token_of_client(request):
+    """A token of its own for every API, named after the client id that asked for it."""
+    token = f"tok-{client_id_of(request)}"
+    return httpx.Response(200, json={"access_token": token, "expires_in": 3600})
+
+
+def wait_until(condition, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while not condition() and time.monotonic() < deadline:
+        time.sleep(0.01)
 
 
 def token_client(responder):
@@ -49,11 +83,31 @@ def test_token_is_requested_with_basic_auth_and_cached(entry):
     assert sent.content == b"grant_type=client_credentials"
 
 
-def test_short_lived_tokens_are_not_cached(entry):
+@pytest.mark.parametrize(("expires_in", "cached"), [(30, False), (60, False), (61, True)])
+def test_only_tokens_living_past_a_minute_are_cached(expires_in, cached, entry):
     client, requests = token_client(
-        lambda request: httpx.Response(200, json={"access_token": "tok", "expires_in": 30})
+        lambda request: httpx.Response(200, json={"access_token": "tok", "expires_in": expires_in})
     )
     auth.build_headers(entry, client)
+    auth.build_headers(entry, client)
+    assert len(requests) == (1 if cached else 2)
+
+
+def test_each_api_keeps_its_own_token(entry, cpf_entry):
+    client, requests = token_client(token_of_client)
+    for _ in range(2):  # the second round comes from the cache
+        assert auth.build_headers(entry, client) == {"Authorization": "Bearer tok-the-id"}
+        assert auth.build_headers(cpf_entry, client) == {"Authorization": "Bearer tok-cpf-id"}
+    assert len(requests) == 2
+
+
+def test_cached_token_expires_thirty_seconds_early(entry, clock):
+    client, requests = token_client(token_of_client)  # lifetime: 3600 s
+    auth.build_headers(entry, client)
+    clock.now += 3569  # a second short of the lifetime minus the 30 s margin
+    auth.build_headers(entry, client)
+    assert len(requests) == 1
+    clock.now += 2  # now past it
     auth.build_headers(entry, client)
     assert len(requests) == 2
 
@@ -226,12 +280,86 @@ def test_concurrent_callers_share_one_token_request(entry):
     ]
     for thread in threads:
         thread.start()
-    deadline = time.monotonic() + 5
-    while not requests and time.monotonic() < deadline:
-        time.sleep(0.01)
+    wait_until(lambda: requests)
     time.sleep(0.2)  # time for the other callers to reach the endpoint, if the code lets them
     release.set()
     for thread in threads:
         thread.join(timeout=5)
     assert len(requests) == 1
     assert results == [{"Authorization": "Bearer tok"}] * 8
+
+
+def test_cached_token_is_not_held_up_by_another_apis_fetch(entry, cpf_entry):
+    release = threading.Event()
+
+    def responder(request):
+        if client_id_of(request) == "cpf-id":
+            release.wait(timeout=5)  # the CPF token endpoint hangs
+        return token_of_client(request)
+
+    client, requests = token_client(responder)
+    auth.build_headers(entry, client)  # the CNPJ token is cached now
+    cold = threading.Thread(target=lambda: auth.build_headers(cpf_entry, client), daemon=True)
+    cold.start()
+    try:
+        wait_until(lambda: len(requests) == 2)  # the CPF request is in flight
+        served = []
+        hot = threading.Thread(
+            target=lambda: served.append(auth.build_headers(entry, client)), daemon=True
+        )
+        hot.start()
+        hot.join(timeout=2)
+        assert not hot.is_alive(), "a cached token waited for another API's token request"
+        assert served == [{"Authorization": "Bearer tok-the-id"}]
+    finally:
+        release.set()
+        cold.join(timeout=5)
+
+
+def test_cached_token_is_served_without_taking_the_lock(entry):
+    """Double-checked locking: the lock is for fetching, so a valid token never needs it."""
+    client, _ = token_client(token_of_client)
+    auth.build_headers(entry, client)
+    served = []
+    reader = threading.Thread(
+        target=lambda: served.append(auth.build_headers(entry, client)), daemon=True
+    )
+    with auth._token_lock_for(entry.id):  # as if a fetch for this very API were under way
+        reader.start()
+        reader.join(timeout=2)
+        assert not reader.is_alive()
+    assert served == [{"Authorization": "Bearer tok-the-id"}]
+
+
+def test_cold_fetches_of_different_apis_run_in_parallel(entry, cpf_entry):
+    release = threading.Event()
+
+    def responder(request):
+        release.wait(timeout=5)
+        return token_of_client(request)
+
+    client, requests = token_client(responder)
+    threads = [
+        threading.Thread(target=lambda e=e: auth.build_headers(e, client), daemon=True)
+        for e in (entry, cpf_entry)
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        wait_until(lambda: len(requests) == 2, timeout=2)
+        assert len(requests) == 2, "the second API's token request waited for the first's"
+    finally:
+        release.set()
+        for thread in threads:
+            thread.join(timeout=5)
+
+
+def test_deeply_nested_token_response_is_a_token_error(entry):
+    nested = b'{"access_token": ' + b"[" * 50_000
+    client, _ = token_client(
+        lambda request: httpx.Response(
+            200, content=nested, headers={"content-type": "application/json"}
+        )
+    )
+    with pytest.raises(auth.TokenError, match="returned no access_token"):
+        auth.build_headers(entry, client)
