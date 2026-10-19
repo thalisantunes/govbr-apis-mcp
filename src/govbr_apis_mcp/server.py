@@ -160,16 +160,19 @@ def call_api(
     """Call an endpoint of a catalog API, resolving base URL and auth automatically.
 
     `path` is appended to the API's base_url (e.g. '/estados/mg' for ibge-localidades)
-    and may carry its own query string, which is merged with `query`. It cannot
-    escape the base URL's prefix. `method` is GET, HEAD, POST, PUT, PATCH, DELETE or
-    OPTIONS. `body` is sent as JSON — only use it with methods that accept a payload
-    (POST/PUT/PATCH). `headers` adds request headers; credentials, Host and
+    and may carry its own query string, which is merged with `query`: a key in `query`
+    replaces that key in the path, and a list value repeats it (`{"uf": ["SP", "RJ"]}`).
+    It cannot escape the base URL's prefix. `method` is GET, HEAD, POST, PUT, PATCH,
+    DELETE or OPTIONS. `body` is sent as JSON — only use it with methods that accept a
+    payload (POST/PUT/PATCH). `headers` adds request headers; credentials, Host and
     connection-framing headers are managed by the gateway, and any you send come back
     listed in `ignored_headers`.
 
     Returns {status, url, body}; JSON bodies come back parsed, others as text,
-    truncated at 60k chars. Entries flagged `pii: true` return personal data
-    (CPF/CNPJ) into this conversation — call those only when the user asked for it.
+    truncated at 60k chars. Redirects are not followed: a 3xx result carries the target
+    in `location`, to call yourself if it is on the same API. Entries flagged
+    `pii: true` return personal data (CPF/CNPJ) into this conversation — call those
+    only when the user asked for it.
     """
     try:
         entry = get_catalog().get(api_id)
@@ -264,20 +267,38 @@ def _caller_headers(
     return merged, sorted(ignored)
 
 
+def _has_dot_segment(path: str) -> bool:
+    """True if `path` has a '.' or '..' segment however a chain of proxies and servers
+    might read it: percent-decoded repeatedly, '\\' taken as '/', ';params' dropped."""
+    for _ in range(3):
+        decoded = unquote(path)
+        if decoded == path:
+            break
+        path = decoded
+    else:  # still changing after three rounds: nothing legitimate is encoded that deep
+        return True
+    return any(
+        segment.split(";", 1)[0] in (".", "..") for segment in path.replace("\\", "/").split("/")
+    )
+
+
 def _build_target(
     base_url: str, path: str, query: dict[str, Any] | None
-) -> tuple[str, dict[str, Any]]:
+) -> tuple[str, httpx.QueryParams]:
     """Join path onto base_url, merging any embedded query string.
 
     httpx replaces (never merges) a URL's query when `params` is given, so a path
     like PTAX's "/CotacaoDolarDia(dataCotacao=@d)?@d='08-06-2026'" would silently
-    lose its parameter. Traversal is rejected by checking the normalized URL still
-    sits under the base prefix.
+    lose its parameter. The two are merged as httpx.QueryParams, which keeps repeated
+    keys (?uf=SP&uf=RJ); a key in `query` replaces the embedded one entirely.
+    Traversal is rejected by looking for dot segments under every decoding a proxy
+    chain might apply, then checking the normalized URL still sits under the base prefix.
     """
     raw_path, _, embedded = path.partition("?")
-    if ".." in unquote(raw_path).split("/"):
+    if _has_dot_segment(raw_path):
         raise ValueError(
-            f"path {path!r} contains '..' — pass a path relative to the API's base URL."
+            f"path {path!r} contains '..' or '.' segments — "
+            "pass a path relative to the API's base URL."
         )
     base = httpx.URL(base_url)
     try:
@@ -285,24 +306,27 @@ def _build_target(
     except httpx.InvalidURL as exc:  # control characters, over-long paths: not a ValueError
         raise ValueError(f"path is not a valid URL path: {exc}") from None
 
-    # Compare after percent-decoding *and* collapsing dot segments: %2e%2e reaches the
-    # remote server encoded, and some servers decode it back into a traversal.
+    # Second line of defence: compare after percent-decoding *and* collapsing dot
+    # segments. The comparison needs a segment boundary, or /api-de-dados-admin would
+    # pass for a base of /api-de-dados (an empty prefix accepts everything).
     prefix = base.path.rstrip("/")
     normalized = posixpath.normpath(unquote(candidate.path))
-    if candidate.host != base.host or not normalized.startswith(prefix or "/"):
+    if candidate.host != base.host or not (
+        normalized == prefix or normalized.startswith(prefix + "/")
+    ):
         raise ValueError(
             f"path {path!r} escapes the API's base URL ({base_url}); "
             "use a path relative to it, without '..' segments."
         )
 
-    params: dict[str, Any] = dict(httpx.QueryParams(embedded)) if embedded else {}
+    params = httpx.QueryParams(embedded)
     if query:
-        params.update(query)
+        params = params.merge(query)
     return str(candidate.copy_with(query=None)), params
 
 
 def _send(
-    method: str, url: str, params: dict[str, Any], body: Any, headers: httpx.Headers
+    method: str, url: str, params: httpx.QueryParams, body: Any, headers: httpx.Headers
 ) -> dict[str, Any]:
     """Stream the response so an oversized payload is cut at the wire, not in memory."""
     with _client.stream(method, url, params=params, json=body, headers=headers) as resp:
@@ -333,24 +357,31 @@ def _send(
     else:
         parsed = text
 
-    return {
+    result = {
         "status": resp.status_code,
         "url": _redact(request_url),
         "content_type": content_type,
         "body": parsed,
     }
+    location = resp.headers.get("location")
+    if location and 300 <= resp.status_code < 400:
+        result["location"] = _redact(location)
+    return result
 
 
 def _redact(url: str) -> str:
     """Blank out query values whose name suggests a credential, so the echoed URL
     never carries a key into the transcript."""
-    parsed = httpx.URL(url)
+    try:
+        parsed = httpx.URL(url)
+    except httpx.InvalidURL:  # a server-supplied Location can be anything
+        return "<invalid URL>"
     if not parsed.query:
         return url
-    safe = {
-        k: ("***" if any(h in k.lower() for h in SENSITIVE_PARAM_HINTS) else v)
-        for k, v in parsed.params.items()
-    }
+    safe = [
+        (k, "***" if any(h in k.lower() for h in SENSITIVE_PARAM_HINTS) else v)
+        for k, v in parsed.params.multi_items()
+    ]
     return str(parsed.copy_with(params=safe))
 
 

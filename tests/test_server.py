@@ -78,13 +78,13 @@ def test_embedded_query_is_merged_not_dropped():
         "/CotacaoDolarDia(dataCotacao=@d)?@d='08-06-2026'",
         {"$format": "json"},
     )
-    assert params == {"@d": "'08-06-2026'", "$format": "json"}
+    assert params == httpx.QueryParams({"@d": "'08-06-2026'", "$format": "json"})
     assert url.endswith("/CotacaoDolarDia(dataCotacao=@d)")
 
 
 def test_path_only_query_survives_without_dict():
     _, params = server._build_target(BASE, "/x?a=1&b=2", None)
-    assert params == {"a": "1", "b": "2"}
+    assert params == httpx.QueryParams({"a": "1", "b": "2"})
 
 
 @pytest.mark.parametrize(
@@ -102,10 +102,122 @@ def test_host_cannot_be_swapped(path):
     assert url.startswith(BASE)
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        pytest.param("/%252e%252e/api-de-dados-admin/x", id="double-encoded"),
+        pytest.param("/%25252e%25252e/x", id="triple-encoded"),
+        pytest.param("/%2525252e%2525252e/x", id="encoded-too-deep-to-trust"),
+        pytest.param("/..;/..;/x", id="path-parameters"),
+        pytest.param("/..%5c..%5cx", id="encoded-backslash"),
+        pytest.param("/..\\..\\x", id="backslash"),
+        pytest.param("/a/./b", id="dot-segment"),
+        pytest.param("/a/%2e/b", id="encoded-dot-segment"),
+    ],
+)
+def test_encoded_traversal_variants_are_rejected(path):
+    """A proxy in front of the API may decode more than once, so decode until stable."""
+    with pytest.raises(ValueError, match="escapes the API's base URL|contains '\\.\\.'"):
+        server._build_target(BASE, path, None)
+
+
+def test_prefix_guard_has_a_segment_boundary(monkeypatch):
+    """Second line of defence: if the dot-segment check ever misses an encoding, a path
+    that normalizes to a sibling of the base prefix is still refused."""
+    monkeypatch.setattr(server, "_has_dot_segment", lambda path: False)
+    with pytest.raises(ValueError, match="escapes the API's base URL"):
+        server._build_target(BASE, "/%252e%252e/api-de-dados-admin/x", None)
+
+
+def test_path_that_repeats_the_prefix_text_is_still_a_child():
+    """The path is appended to the base, so /api-de-dados-admin lands *under* it."""
+    url, _ = server._build_target(BASE, "/api-de-dados-admin/x", None)
+    assert url == f"{BASE}/api-de-dados-admin/x"
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["", "/", "viagens", "/viagens?x=1", "/a.b/c..d/.hidden", "/a%20b", "/V(K='X_Y')"],
+)
+def test_ordinary_paths_pass_the_guard(path):
+    url, _ = server._build_target(BASE, path, None)
+    assert url.startswith(BASE)
+
+
+def test_unusable_path_characters_are_a_value_error():
+    with pytest.raises(ValueError, match="not a valid URL path"):
+        server._build_target(BASE, "/x\x00y", None)
+
+
+def test_repeated_query_keys_survive_from_path_and_caller(catalog, wire):
+    requests = wire()
+    out = server.call_api(
+        "ibge-localidades",
+        "/municipios?uf=SP&uf=RJ&pagina=1",
+        query={"pagina": "2", "ano": ["2024", "2025"]},
+    )
+    sent = requests[0].url.params
+    assert sent.get_list("uf") == ["SP", "RJ"]
+    assert sent.get_list("pagina") == ["2"]  # the caller's key replaces the embedded one
+    assert sent.get_list("ano") == ["2024", "2025"]
+    assert httpx.URL(out["url"]).params.get_list("uf") == ["SP", "RJ"]
+
+
+def test_caller_query_replaces_every_embedded_value_of_a_key():
+    _, params = server._build_target(BASE, "/x?uf=SP&uf=RJ", {"uf": "MG"})
+    assert list(params.multi_items()) == [("uf", "MG")]
+
+
+def test_redact_keeps_repeated_values():
+    out = httpx.URL(server._redact("https://x.gov.br/a?uf=SP&uf=RJ&token=1&token=2"))
+    assert out.params.get_list("uf") == ["SP", "RJ"]
+    assert out.params.get_list("token") == ["***", "***"]
+
+
+def test_redact_survives_an_unparseable_url():
+    assert server._redact("http://[::1") == "<invalid URL>"
+
+
+def test_redirects_are_reported_not_followed(catalog, wire):
+    requests = wire(
+        lambda request: httpx.Response(
+            301, headers={"Location": "https://servicodados.ibge.gov.br/new?key=SECRET&a=1"}
+        )
+    )
+    out = server.call_api("ibge-localidades", "/estados")
+    assert out["status"] == 301
+    assert len(requests) == 1
+    location = httpx.URL(out["location"])
+    assert (location.host, location.path) == ("servicodados.ibge.gov.br", "/new")
+    assert (location.params.get("key"), location.params.get("a")) == ("***", "1")
+    assert "SECRET" not in str(out)
+
+
+def test_relative_redirect_location_is_redacted_too(catalog, wire):
+    wire(lambda request: httpx.Response(302, headers={"Location": "/login?token=abc"}))
+    out = server.call_api("ibge-localidades", "/estados")
+    assert httpx.URL(out["location"]).params.get("token") == "***"
+    assert "abc" not in str(out)
+
+
+def test_malformed_redirect_location_does_not_break_the_call(catalog, wire):
+    """httpx itself rejects a bad Location on 301/302/303/307/308; a 300 reaches us as is."""
+    wire(lambda request: httpx.Response(300, headers={"Location": "http://[::1"}))
+    out = server.call_api("ibge-localidades", "/estados")
+    assert (out["status"], out["location"]) == (300, "<invalid URL>")
+
+
+def test_redirect_status_without_location_has_no_location_key(catalog, wire):
+    wire(lambda request: httpx.Response(304))
+    out = server.call_api("ibge-localidades", "/estados")
+    assert out["status"] == 304
+    assert "location" not in out
+
+
 def test_normal_path_is_preserved():
     url, params = server._build_target(BASE, "servidores", None)
     assert url == f"{BASE}/servidores"
-    assert params == {}
+    assert params == httpx.QueryParams()
 
 
 def test_redact_masks_credential_like_params():
