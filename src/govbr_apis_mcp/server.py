@@ -8,6 +8,7 @@ call to invoke it with the right auth profile.
 
 from __future__ import annotations
 
+import http.cookiejar
 import json
 import logging
 import posixpath
@@ -33,7 +34,8 @@ ALLOWED_METHODS = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
 # or defeat the response size cut (Accept-Encoding stays "identity" so streaming really
 # stops at MAX_BODY_CHARS instead of after inflating a compressed chunk). X-Forwarded-*
 # is matched by prefix and the entry's own credential header is added per call. Names are
-# compared with '_' read as '-', as CGI/WSGI/PHP backends do.
+# compared with '_' read as '-', as CGI/WSGI/PHP backends do (that is how a `Proxy` header
+# becomes the HTTP_PROXY of httpoxy).
 PROTECTED_HEADERS = frozenset(
     {
         "authorization",
@@ -56,10 +58,13 @@ PROTECTED_HEADERS = frozenset(
         "x-rewrite-url",
         "x-real-ip",
         "x-client-ip",
+        "x-cluster-client-ip",
+        "x-host",
         "x-originating-ip",
         "true-client-ip",
         "cf-connecting-ip",
         "client-ip",
+        "proxy",
         "proxy-connection",
         "via",
         "max-forwards",
@@ -67,17 +72,44 @@ PROTECTED_HEADERS = frozenset(
 )
 HEADER_NAME_RE = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")  # an RFC 9110 token
 
+
+def _new_client(**kwargs: Any) -> httpx.Client:
+    """The gateway's one HTTP client (tests pass a MockTransport).
+
+    follow_redirects stays False: these requests carry credentials, so a 3xx must not steer them.
+    Redirect handling for spec fetches lives in openapi.py. Cookies are refused outright: one
+    shared jar would hand a cookie an API set for its whole domain suffix (.leg.br, .jus.br)
+    to every other API under it.
+    """
+    client = httpx.Client(
+        timeout=30, headers={"User-Agent": f"govbr-apis-mcp/{__version__}"}, **kwargs
+    )
+    client.cookies.jar.set_policy(http.cookiejar.DefaultCookiePolicy(allowed_domains=[]))
+    return client
+
+
 mcp = MCPServer("govbr-apis-mcp", version=__version__)
 _catalog: Catalog | None = None
-# follow_redirects stays False: these requests carry credentials, so a 3xx must not steer them.
-# Redirect handling for spec fetches lives in openapi.py.
-_client = httpx.Client(timeout=30, headers={"User-Agent": f"govbr-apis-mcp/{__version__}"})
+_client = _new_client()
+# The SDK enables INFO logging, and httpx then logs "HTTP Request: GET <url>" with the full
+# query string, bypassing _redact. Done at import rather than in main(): cie.py and scripts
+# use this module as a library.
+for _logger in ("httpx", "httpcore"):
+    logging.getLogger(_logger).setLevel(logging.WARNING)
+
+
+class CatalogError(Exception):
+    """The catalog could not be loaded; the message says why."""
 
 
 def get_catalog() -> Catalog:
     global _catalog
     if _catalog is None:
-        _catalog = Catalog.load()
+        try:
+            _catalog = Catalog.load()
+        except Exception as exc:  # noqa: BLE001 — whatever is wrong with the files, say so
+            message = f"The API catalog could not be loaded ({type(exc).__name__}): {exc}"
+            raise CatalogError(message) from None
     return _catalog
 
 
@@ -92,7 +124,7 @@ def search_catalog(query: str, category: str | None = None) -> dict[str, Any]:
     """
     try:
         matches = get_catalog().search(query, category=category)
-    except ValueError as exc:
+    except (CatalogError, ValueError) as exc:
         return {"error": str(exc)}
     shown = matches[:DEFAULT_LIST_LIMIT]
     return {
@@ -116,6 +148,8 @@ def list_apis(
     """
     try:
         entries = get_catalog().list(category=category, status=status)
+    except CatalogError as exc:
+        return {"error": str(exc)}
     except ValueError as exc:
         return {
             "error": str(exc),
@@ -144,7 +178,7 @@ def describe_api(api_id: str, path: str | None = None, method: str | None = None
     """
     try:
         entry = get_catalog().get(api_id)
-    except KeyError as exc:
+    except (KeyError, CatalogError) as exc:
         return {"error": str(exc)}
 
     result: dict[str, Any] = {"api": entry.detail()}
@@ -188,7 +222,7 @@ def call_api(
     """
     try:
         entry = get_catalog().get(api_id)
-    except KeyError as exc:
+    except (KeyError, CatalogError) as exc:
         return {"error": str(exc)}
 
     if not _callable_now(entry):
@@ -241,6 +275,9 @@ def call_api(
         return {"error": f"{type(exc).__name__}: {message}", "url": url}
     except httpx.HTTPError as exc:
         return {"error": f"{type(exc).__name__}: {exc}", "url": url}
+    except (httpx.InvalidURL, UnicodeError):
+        # httpx builds the request a 3xx points to even though it is told not to follow it
+        return {"error": "upstream sent a malformed Location header", "url": url}
 
     if ignored:
         result["ignored_headers"] = ignored
@@ -256,14 +293,14 @@ def credentials_status(api_id: str | None = None) -> list[dict[str, Any]]:
     accepts the entry right now (a requires_contract entry, such as Serpro's, only does
     once they are).
     """
-    catalog = get_catalog()
     try:
+        catalog = get_catalog()
         entries = (
             [catalog.get(api_id)]
             if api_id
             else [e for e in catalog.list() if e.auth != "none" and e.category != "conecta"]
         )
-    except KeyError as exc:
+    except (KeyError, CatalogError) as exc:
         return [{"error": str(exc)}]
     return [
         {
@@ -277,8 +314,12 @@ def credentials_status(api_id: str | None = None) -> list[dict[str, Any]]:
 
 
 def _callable_now(entry: ApiEntry) -> bool:
-    """Whether call_api accepts the entry: available/unstable ones, plus requires_contract
-    ones once their credentials are in the environment (a Serpro contract is just that)."""
+    """Whether call_api accepts the entry.
+
+    ApiEntry.callable only knows the catalog: status available or unstable, with a base_url.
+    This adds the requires_contract entries (Serpro) whose credentials are in the
+    environment, because for them holding the contract means nothing more than that.
+    """
     if entry.callable:
         return True
     return (
@@ -321,18 +362,26 @@ def _caller_headers(
     return merged, sorted(ignored)
 
 
-def _has_dot_segment(path: str) -> bool:
-    """True if `path` has a '.' or '..' segment however a chain of proxies and servers
-    might read it: percent-decoded repeatedly, '\\' taken as '/', ';params' dropped."""
+def _decoded(path: str) -> str | None:
+    """`path` percent-decoded until it stops changing, as a chain of proxies and servers may
+    do; None if it is still changing after three rounds (nothing legitimate is encoded that
+    deep)."""
     for _ in range(3):
         decoded = unquote(path)
         if decoded == path:
-            break
+            return path
         path = decoded
-    else:  # still changing after three rounds: nothing legitimate is encoded that deep
+    return None
+
+
+def _has_dot_segment(path: str) -> bool:
+    """True if `path` has a '.' or '..' segment however a chain of proxies and servers
+    might read it: percent-decoded repeatedly, '\\' taken as '/', ';params' dropped."""
+    decoded = _decoded(path)
+    if decoded is None:  # undecidable: refuse it
         return True
     return any(
-        segment.split(";", 1)[0] in (".", "..") for segment in path.replace("\\", "/").split("/")
+        segment.split(";", 1)[0] in (".", "..") for segment in decoded.replace("\\", "/").split("/")
     )
 
 
@@ -350,6 +399,14 @@ def _build_target(
     under the base prefix.
     """
     raw_path, _, embedded = path.partition("?")
+    if "#" in path:  # httpx cuts a fragment off, so nothing after it would be checked or sent
+        raise ValueError(
+            f"path {path!r} contains '#': a fragment is never sent. "
+            "Percent-encode it as %23 if it is meant literally."
+        )
+    decoded = _decoded(raw_path)
+    if decoded is not None and any(ord(char) < 0x20 or ord(char) == 0x7F for char in decoded):
+        raise ValueError(f"path {path!r} contains control characters.")
     if _has_dot_segment(raw_path):
         raise ValueError(
             f"path {path!r} contains '..' or '.' segments — "
@@ -383,7 +440,12 @@ def _build_target(
 def _send(
     method: str, url: str, params: httpx.QueryParams, body: Any, headers: httpx.Headers
 ) -> dict[str, Any]:
-    """Stream the response so an oversized payload is cut at the wire, not in memory."""
+    """Stream the response so an oversized payload is cut at the wire, not in memory.
+
+    Accepted risk: the cut counts decoded text, and `Accept-Encoding: identity` only helps
+    while the server honors it. One that compresses anyway can still inflate a small chunk
+    into megabytes before the cut; bounded decompression is left for a follow-up.
+    """
     with _client.stream(method, url, params=params, json=body, headers=headers) as resp:
         chunks: list[str] = []
         size = 0
@@ -407,7 +469,7 @@ def _send(
     elif text and "json" in (content_type or ""):  # an empty body (HEAD, 204) is not bad JSON
         try:
             parsed = json.loads(text)
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):  # bad syntax, too many digits, nested too deep
             parsed = {"text": text, "parse_error": "content-type said JSON but body did not parse"}
     else:
         parsed = text
@@ -441,10 +503,6 @@ def _redact(url: str) -> str:
 
 
 def main() -> None:
-    # The SDK turns on INFO logging, and httpx then writes "HTTP Request: GET <url>" to
-    # stderr with the full query string, bypassing _redact.
-    for name in ("httpx", "httpcore"):
-        logging.getLogger(name).setLevel(logging.WARNING)
     mcp.run()
 
 

@@ -2,6 +2,8 @@
 
 import dataclasses
 import logging
+import subprocess
+import sys
 
 import httpx
 import pytest
@@ -35,9 +37,7 @@ def wire(monkeypatch):
             requests.append(request)
             return responder(request)
 
-        client = httpx.Client(
-            transport=httpx.MockTransport(handler), headers=server._client.headers
-        )
+        client = server._new_client(transport=httpx.MockTransport(handler))
         monkeypatch.setattr(server, "_client", client)
         return requests
 
@@ -113,6 +113,27 @@ def test_traversal_is_rejected(path):
         server._build_target(BASE, path, None)
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        pytest.param("\\..#", id="dots-hidden-before-a-fragment"),
+        pytest.param("/x#/..", id="dots-after-a-fragment"),
+        pytest.param("/ok#frag", id="plain-fragment"),
+        pytest.param("/x\x00y", id="literal-nul"),
+        pytest.param("/x\ny", id="literal-newline"),
+        pytest.param("..%00", id="encoded-nul"),
+        pytest.param("/a%2500/b", id="double-encoded-nul"),
+        pytest.param("/a%0Ab", id="encoded-newline"),
+        pytest.param("/a%7Fb", id="encoded-del"),
+    ],
+)
+def test_fragments_and_control_characters_are_rejected(path):
+    """A fragment is cut off before the request leaves, so the checks must not trust what
+    follows it; a NUL or any control character can truncate or reshape the path upstream."""
+    with pytest.raises(ValueError, match="'#'|control character"):
+        server._build_target(BASE, path, None)
+
+
 @pytest.mark.parametrize("path", ["//evil.com/x", "https://evil.com/x", "\\\\evil.com/x"])
 def test_host_cannot_be_swapped(path):
     url, _ = server._build_target(BASE, path, None)
@@ -142,9 +163,9 @@ def test_ordinary_paths_pass_the_guard(path):
     assert url.startswith(BASE)
 
 
-def test_unusable_path_characters_are_a_value_error():
+def test_a_path_httpx_cannot_parse_is_a_value_error():
     with pytest.raises(ValueError, match="not a valid URL path"):
-        server._build_target(BASE, "/x\x00y", None)
+        server._build_target(BASE, "/" + "a" * 70_000, None)
 
 
 def test_repeated_query_keys_survive_from_path_and_caller(catalog, wire):
@@ -208,9 +229,27 @@ def test_relative_redirect_location_is_resolved_and_redacted(location, resolved,
     assert "abc" not in str(out)
 
 
-def test_malformed_redirect_location_does_not_break_the_call(catalog, wire):
-    """httpx itself rejects a bad Location on 301/302/303/307/308; a 300 reaches us as is."""
-    wire(lambda request: httpx.Response(300, headers={"Location": "http://[::1"}))
+@pytest.mark.parametrize(
+    ("status", "location"),
+    [
+        pytest.param(301, b"https:foo", id="invalid-url"),
+        pytest.param(308, b"https://xn--/", id="malformed-idna-label"),
+    ],
+)
+def test_malformed_redirect_location_is_an_error(status, location, catalog, wire):
+    """httpx builds the next request even when told not to follow, and it can choke on it."""
+    wire(lambda request: httpx.Response(status, headers=[(b"location", location)]))
+    out = server.call_api("ibge-localidades", "/estados")
+    assert out == {
+        "error": "upstream sent a malformed Location header",
+        "url": "https://servicodados.ibge.gov.br/api/v1/localidades/estados",
+    }
+
+
+@pytest.mark.parametrize("location", [b"http://[::1", b"https://x.gov.br:abc/"])
+def test_unvetted_redirect_location_does_not_break_the_call(location, catalog, wire):
+    """httpx vets Location only on 301/302/303/307/308; on a 300 it reaches us as it came."""
+    wire(lambda request: httpx.Response(300, headers=[(b"location", location)]))
     out = server.call_api("ibge-localidades", "/estados")
     assert (out["status"], out["location"]) == (300, "<invalid URL>")
 
@@ -238,10 +277,19 @@ def test_redact_keeps_urls_without_query():
     assert server._redact("https://x.gov.br/a") == "https://x.gov.br/a"
 
 
-def test_call_api_rejects_body_on_get(monkeypatch):
-    monkeypatch.setattr(server, "_catalog", Catalog.load())
-    out = server.call_api("ibge-localidades", "/estados", method="GET", body={"a": 1})
-    assert "body is not supported" in out["error"]
+@pytest.mark.parametrize("method", ["GET", "HEAD", "DELETE"])
+def test_call_api_rejects_a_body_on_methods_without_a_payload(method, catalog, wire):
+    requests = wire()
+    out = server.call_api("ibge-localidades", "/estados", method=method, body={"a": 1})
+    assert f"body is not supported with {method}" in out["error"]
+    assert requests == []
+
+
+def test_result_url_hides_credential_like_query_values(catalog, wire):
+    wire()
+    out = server.call_api("ibge-localidades", "/estados", query={"chave": "S3CR3T", "uf": "SP"})
+    assert "S3CR3T" not in str(out)
+    assert httpx.URL(out["url"]).params.get("uf") == "SP"
 
 
 def test_call_api_blocks_not_callable(monkeypatch):
@@ -325,25 +373,45 @@ def test_reports_the_package_version():
     assert server._client.headers["user-agent"] == f"govbr-apis-mcp/{__version__}"
 
 
-def test_main_quiets_httpx_logging(monkeypatch):
-    """The SDK enables INFO logging, and httpx would then print every URL, query included."""
-    names = ("httpx", "httpcore")
-    before = {name: logging.getLogger(name).level for name in names}
-    monkeypatch.setattr(server.mcp, "run", lambda: None)
-    try:
-        server.main()
-        assert {name: logging.getLogger(name).level for name in names} == {
-            "httpx": logging.WARNING,
-            "httpcore": logging.WARNING,
-        }
-    finally:
-        for name, level in before.items():
-            logging.getLogger(name).setLevel(level)
+def test_importing_the_server_silences_httpx_logging():
+    """The SDK enables INFO logging, and httpx would then print every URL, query included.
+    cie.py and scripts import this module as a library, with no main() to quiet it."""
+    code = (
+        "import logging, govbr_apis_mcp.server; "
+        "print(logging.getLogger('httpx').level, logging.getLogger('httpcore').level)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=120, check=True
+    )
+    assert result.stdout.split() == [str(logging.WARNING)] * 2
 
 
 def test_shared_client_never_follows_redirects():
     """Its requests carry credentials, so a 3xx must not steer them to another host."""
     assert server._client.follow_redirects is False
+
+
+def test_cookies_are_never_stored_or_replayed(catalog, wire):
+    """One shared jar would hand a cookie an API set for its whole domain suffix (.leg.br)
+    to every other API under it, and replay a session cookie to the same host."""
+    sent = []
+
+    def responder(request):
+        sent.append(request.headers.get("cookie"))
+        return httpx.Response(
+            200,
+            json={},
+            headers=[
+                ("set-cookie", "sid=SECRET; Domain=.leg.br; Path=/"),
+                ("set-cookie", "host=only; Path=/"),
+            ],
+        )
+
+    wire(responder)
+    server.call_api("camara-dados-abertos", "/deputados")
+    server.call_api("senado-dados-abertos", "/senador/lista/atual")
+    server.call_api("camara-dados-abertos", "/deputados")
+    assert sent == [None, None, None]
 
 
 def test_call_api_unknown_id_returns_error_dict(monkeypatch):
@@ -421,6 +489,10 @@ def test_caller_headers_cannot_duplicate_the_managed_credential(catalog, wire, m
         "X_Forwarded_For",
         "Transfer_Encoding",
         "x_http_method_override",
+        "Authorization",
+        "Proxy",
+        "X-Cluster-Client-IP",
+        "X-Host",
     ],
 )
 def test_framing_and_proxy_headers_never_reach_the_wire(name, catalog, wire):
@@ -590,6 +662,10 @@ def test_missing_credentials_are_reported_with_their_status(catalog, wire, monke
         pytest.param({"path": "/x\x00y"}, id="nul-in-path"),
         pytest.param({"path": "/x\ny"}, id="newline-in-path"),
         pytest.param({"path": "/" + "a" * 70_000}, id="path-too-long"),
+        pytest.param({"path": "\\..#"}, id="dots-hidden-before-a-fragment"),
+        pytest.param({"path": "/x#/.."}, id="dots-after-a-fragment"),
+        pytest.param({"path": "..%00"}, id="encoded-nul"),
+        pytest.param({"query": {"a": "x" * 70_000}}, id="query-too-long"),
         pytest.param({"query": {"a": "\ud800"}}, id="lone-surrogate-in-query"),
         pytest.param({"method": "POST", "body": {"a": float("nan")}}, id="nan-in-body"),
         pytest.param({"headers": {"X-Name": "José"}}, id="non-ascii-header-value"),
@@ -609,6 +685,37 @@ def test_invalid_input_is_an_error_before_any_request(kwargs, oauth_api, wire):
     out = server.call_api("oauth-demo", **{"path": "/things", **kwargs})
     assert "error" in out
     assert requests == []
+
+
+@pytest.fixture(params=["no-yaml-files", "broken-yaml", "unknown-field"])
+def unloadable_catalog(request, monkeypatch, tmp_path):
+    """Three ways the catalog can fail to load, none of which every tool used to survive."""
+    monkeypatch.setattr(server, "_catalog", None)
+    monkeypatch.delenv("GOVBR_CATALOG_DIR", raising=False)
+    monkeypatch.delenv("GOVBR_EXTRA_CATALOG_DIR", raising=False)
+    if request.param == "no-yaml-files":
+        monkeypatch.setenv("GOVBR_CATALOG_DIR", str(tmp_path))
+        return
+    text = {"broken-yaml": "apis: [oops\n", "unknown-field": "apis:\n  - {id: x, bogus: 1}\n"}
+    (tmp_path / "extra.yaml").write_text(text[request.param])
+    monkeypatch.setenv("GOVBR_EXTRA_CATALOG_DIR", str(tmp_path))
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        pytest.param(lambda: server.search_catalog("cnpj"), id="search_catalog"),
+        pytest.param(lambda: server.list_apis(), id="list_apis"),
+        pytest.param(lambda: server.describe_api("datajud"), id="describe_api"),
+        pytest.param(lambda: server.call_api("datajud", "/x"), id="call_api"),
+        pytest.param(lambda: server.credentials_status("datajud"), id="credentials_status-one"),
+        pytest.param(lambda: server.credentials_status(), id="credentials_status-all"),
+    ],
+)
+def test_every_tool_reports_a_catalog_that_will_not_load(call, unloadable_catalog):
+    out = call()
+    error = (out[0] if isinstance(out, list) else out)["error"]
+    assert error.startswith("The API catalog could not be loaded")
 
 
 def test_search_catalog_reports_truncation(monkeypatch):
@@ -658,6 +765,22 @@ def test_send_falls_back_to_text_when_json_does_not_parse(wire):
     }
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(b"[" * 50_000, id="nested-too-deep"),
+        pytest.param(b"1" * 5_000, id="integer-with-too-many-digits"),
+    ],
+)
+def test_json_that_python_refuses_to_parse_is_a_parse_error(body, wire):
+    wire(
+        lambda request: httpx.Response(
+            200, content=body, headers={"content-type": "application/json"}
+        )
+    )
+    assert send()["body"]["parse_error"] == "content-type said JSON but body did not parse"
+
+
 @pytest.mark.parametrize(("method", "status"), [("HEAD", 200), ("GET", 204)])
 def test_empty_body_with_a_json_content_type_is_not_a_parse_error(method, status, catalog, wire):
     wire(lambda request: httpx.Response(status, headers={"content-type": "application/json"}))
@@ -694,6 +817,39 @@ def test_send_truncates_only_past_the_limit(size, truncated, wire):
         lambda request: httpx.Response(200, text="x" * size, headers={"content-type": "text/plain"})
     )
     assert isinstance(send()["body"], dict) is truncated
+
+
+def chunked(data: bytes, size: int):
+    for start in range(0, len(data), size):
+        yield data[start : start + size]
+
+
+@pytest.mark.parametrize(
+    ("size", "truncated"), [(59_999, False), (60_000, False), (60_001, True), (150_000, True)]
+)
+def test_send_truncation_when_the_body_arrives_in_many_chunks(size, truncated, wire):
+    text = ("0123456789" * 15_000)[:size]
+    wire(
+        lambda request: httpx.Response(
+            200, content=chunked(text.encode(), 997), headers={"content-type": "text/plain"}
+        )
+    )
+    body = send()["body"]
+    if truncated:
+        assert body["truncated"] is True
+        assert body["text"] == text[: server.MAX_BODY_CHARS]
+    else:
+        assert body == text
+
+
+def test_send_decodes_multibyte_characters_split_across_chunks(wire):
+    text = "ação é útil " * 3_000
+    wire(
+        lambda request: httpx.Response(
+            200, content=chunked(text.encode(), 7), headers={"content-type": "text/plain"}
+        )
+    )
+    assert send()["body"] == text
 
 
 # --- describe_api ---------------------------------------------------------------------------
