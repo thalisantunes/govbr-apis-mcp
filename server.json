@@ -2,8 +2,8 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.thalisantunes/govbr-apis-mcp",
   "title": "gov.br APIs MCP",
-  "description": "Brazilian government APIs through a spec-driven gateway over a YAML catalog.",
-  "version": "0.1.0",
+  "description": "A catalog-driven gateway over Brazilian government APIs, loading OpenAPI specs on demand.",
+  "version": "0.2.0",
   "repository": {
     "url": "https://github.com/thalisantunes/govbr-apis-mcp",
     "source": "github"
@@ -13,7 +13,7 @@
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "govbr-apis-mcp",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"
@@ -78,6 +78,30 @@
           "description": "Access code (codigoAcesso) for the CIE validator used for meia-entrada, issued to the venue or producer",
           "isRequired": false,
           "isSecret": true
+        },
+        {
+          "name": "GOVBR_CATALOG_DIR",
+          "description": "Directory of catalog YAML files that replaces the packaged catalog (trusted input)",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "GOVBR_EXTRA_CATALOG_DIR",
+          "description": "Directory of catalog YAML files whose entries are added to the catalog, overriding same-id ones",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "GOVBR_EXTRA_ALLOWED_HOSTS",
+          "description": "Comma-separated extra hostnames catalog URLs may use; add one only if you trust it with the credentials sent there",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "XDG_CACHE_HOME",
+          "description": "Base directory of the OpenAPI spec cache (a govbr-apis-mcp folder is created below it); defaults to ~/.cache",
+          "isRequired": false,
+          "isSecret": false
         }
       ]
     }

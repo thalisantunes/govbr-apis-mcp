@@ -86,11 +86,12 @@ os dois: o fluxo trata ambos como pendência documental (no exit 3, depois de te
 - **Premissas sobre a FESN, a confirmar.** Duas leituras não vêm de uma resposta gravada
   neste repositório: (1) um código desconhecido volta como 404 com o objeto
   `{"name": "NotFoundError"}`; (2) uma carteirinha existente volta com o `useCode` consultado
-  no corpo (a descrição do catálogo não lista esse campo). Ambas derivam de comportamento da
-  FESN observado e relatado durante o desenvolvimento, e só viram fato com uma consulta real,
-  com um código existente e um inexistente, registrando status, content-type e corpo sem dado
-  pessoal. Se divergirem, o efeito é conservador: o que a FESN responder fora desse formato
-  vira "não validado" (exit 3), nunca aprovação.
+  no corpo. A descrição e a nota de `fesn-cie-validador` no catálogo trazem as duas com a
+  mesma ressalva. Ambas derivam de comportamento da FESN observado e relatado durante o
+  desenvolvimento, e só viram fato com uma consulta real, com um código existente e um
+  inexistente, registrando status, content-type e corpo sem dado pessoal. Se divergirem, o
+  efeito é conservador: o que a FESN responder fora desse formato vira "não validado"
+  (exit 3), nunca aprovação.
 - **Entrada.** O que toda base precisa (código de uso, datas, CNPJ) é validado antes de
   qualquer chamada de rede. Uma data de nascimento ou do evento informada e vazia é erro
   (`InvalidInput`), não uma checagem pulada nem "hoje"; só `None` pede o padrão. O formato do

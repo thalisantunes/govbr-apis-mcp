@@ -24,7 +24,7 @@ jobs:
       - run: ruff format --check .
       - run: pytest -q
       - run: python -m build
-      - run: python -m twine check dist/*
+      - run: python -m twine check --strict dist/*
       # Lint, tests and twine check all pass for a wheel without the catalog, so load it
       # from the wheel itself, in a clean venv and outside the checkout.
       - name: Smoke-test the wheel

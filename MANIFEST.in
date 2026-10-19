@@ -1,0 +1,6 @@
+# The test suite runs the scripts it covers (poc/ and scripts/), so the sdist carries them
+# next to tests/ and the suite passes when run from the unpacked sdist.
+graft tests
+graft scripts
+graft poc
+global-exclude __pycache__ *.py[cod]

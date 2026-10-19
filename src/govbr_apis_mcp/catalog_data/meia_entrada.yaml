@@ -47,15 +47,27 @@ apis:
       Valida CIE emitida pela FESN, uma das emissoras fora da base DNE.
       GET /api/students/usecode/{codigoUso} — sem autenticação e sem data de
       nascimento. Retorna name, cpf, birth, entity (instituição), course,
-      courseType, validity e photo. HTTP 200 com corpo significa que a carteirinha
-      existe; carteirinha desconhecida não retorna o objeto.
+      courseType, validity e photo. Só vale a resposta com o useCode consultado e uma
+      validity legível (e, se o nascimento foi informado, birth igual a ele); um 404
+      com {"name": "NotFoundError"} é lido como "não encontrada". O useCode no corpo
+      e esse 404 são premissas a confirmar na API real (ver notes).
     tags: [meia-entrada, estudante, cie, eventos, validacao]
     notes: >-
       Verificado em 2026-08-07 com carteirinha real (IFRS) que a base DNE não conhece
       — prova de que "não achou no DNE" nunca pode virar "não tem direito".
       A API não valida expiração nem titularidade: `validity` vem no corpo mas não é
-      aplicada, e o código de uso sozinho libera a consulta. Ambas as checagens são
-      feitas por nós em `cie.interpret_fesn`.
+      aplicada, e o código de uso sozinho libera a consulta. A decisão é nossa, em
+      `cie.interpret_fesn`: exige o `useCode` consultado, confere a validade contra a
+      data do evento e, se o nascimento foi informado, compara com `birth` (sem
+      nascimento na resposta, recusa). Essa conferência pega erro de digitação, não
+      fraude: a FESN devolve `birth` sem autenticação, então quem tem o código de uso lê
+      a data e a digita de volta. Só o 404 com o objeto de erro esperado vale como
+      "não encontrada"; outro 404 ou qualquer status fora de 2xx é "não validado".
+      Premissas a confirmar com uma consulta real (comportamento da FESN observado e
+      relatado durante o desenvolvimento, não gravado neste repositório): o `useCode`
+      consultado vem no corpo e um código desconhecido volta como 404 com
+      `{"name": "NotFoundError"}`. Se divergirem, a resposta vira "não validado",
+      nunca aprovação.
 
   - id: idjovem-validacao
     name: ID Jovem — validação de carteira
@@ -72,8 +84,8 @@ apis:
     tags: [meia-entrada, id-jovem, baixa-renda, jovem]
     notes: >-
       Caminho para integração sistêmica: pleitear a API conecta-id-jovem junto à SNJ
-      (juventude@presidencia.gov.br) — é a única das 95 do Conecta cuja descrição
-      oficial admite instituições privadas, mediante aprovação caso a caso.
+      (juventude@presidencia.gov.br) — a descrição oficial dela admite instituições
+      privadas, mediante aprovação caso a caso.
       O validador web é SPA protegida por WAF; endpoint de backend não confirmado.
 
   - id: inss-certificado-pcd
@@ -82,7 +94,7 @@ apis:
     category: meia-entrada
     status: manual_only
     auth: none
-    docs_url: https://www.gov.br/inss/pt-br/saiba-mais/seus-direitos/certificado-de-pessoa-com-deficiencia
+    docs_url: https://www.gov.br/pt-br/servicos/emitir-certificado-da-pessoa-com-deficiencia
     description: >-
       Único comprovante digital de PcD que o cidadão emite por conta própria (Meu INSS,
       PDF com QR de autenticidade, validade 90 dias). A conferência é pelo QR do
@@ -109,5 +121,5 @@ apis:
       dados-gov-br para buscar o conjunto "Sistema e-MEC"). Nunca contém dados de aluno.
     tags: [educacao, ies, estudante, validacao-indireta]
     notes: >-
-      emec.mec.gov.br e dadosabertos.mec.gov.br respondem 403 a cliente não-browser.
-      Existe scraper não-oficial (github.com/pavanad/emec-api), fora do escopo deste MCP.
+      Verificado em 2026-10-19: emec.mec.gov.br e dadosabertos.mec.gov.br respondem 403 a
+      cliente não-browser.
