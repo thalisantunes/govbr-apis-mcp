@@ -77,6 +77,9 @@ jobs:
               len((yaml.safe_load(path.read_text(encoding="utf-8")) or {}).get("apis", []))
               for path in tree.glob("*.yaml")
           )
+          # The smoke proves the wheel is self-sufficient: ignore operator overrides.
+          for var in ("GOVBR_CATALOG_DIR", "GOVBR_EXTRA_CATALOG_DIR", "GOVBR_EXTRA_ALLOWED_HOSTS"):
+              os.environ.pop(var, None)
           # Explicit directory: a bare load() would obey GOVBR_CATALOG_DIR.
           count = len(Catalog.load(DEFAULT_CATALOG_DIR).list())
           print(f"{count} entries loaded from {DEFAULT_CATALOG_DIR}; source tree has {expected}")
