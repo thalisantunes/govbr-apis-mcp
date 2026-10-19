@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import posixpath
+import re
 from typing import Any
 from urllib.parse import unquote
 
@@ -17,15 +18,37 @@ import httpx
 from mcp.server.mcpserver import MCPServer
 
 from . import auth as auth_module
-from .catalog import CATEGORIES, STATUSES, Catalog
+from .catalog import CATEGORIES, STATUSES, ApiEntry, Catalog
 from .openapi import describe_operation, fetch_spec, summarize_spec
 
 MAX_BODY_CHARS = 60_000
 DEFAULT_LIST_LIMIT = 40
 SENSITIVE_PARAM_HINTS = ("key", "token", "secret", "senha", "password", "chave")
-# Headers the caller may not set: they would override the catalog-managed
-# credential or redirect the request to another virtual host.
-PROTECTED_HEADERS = {"authorization", "host", "cookie"}
+ALLOWED_METHODS = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
+# Headers the caller may not set: they would override the catalog-managed credential,
+# redirect the request to another virtual host, tamper with its framing, or defeat the
+# response size cut (Accept-Encoding stays "identity" so streaming really stops at
+# MAX_BODY_CHARS instead of after inflating a compressed chunk). X-Forwarded-* is
+# matched by prefix and the entry's own credential header is added per call.
+PROTECTED_HEADERS = frozenset(
+    {
+        "authorization",
+        "proxy-authorization",
+        "host",
+        "cookie",
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "upgrade",
+        "te",
+        "trailer",
+        "keep-alive",
+        "forwarded",
+        "accept-encoding",
+    }
+)
+HEADER_NAME_RE = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")  # an RFC 9110 token
+HEADER_VALUE_RE = re.compile(r"[\t\x20-\x7e]*")  # printable ASCII: no CR, LF or NUL
 
 mcp = MCPServer("govbr-apis-mcp")
 _catalog: Catalog | None = None
@@ -138,8 +161,11 @@ def call_api(
 
     `path` is appended to the API's base_url (e.g. '/estados/mg' for ibge-localidades)
     and may carry its own query string, which is merged with `query`. It cannot
-    escape the base URL's prefix. `body` is sent as JSON — only use it with methods
-    that accept a payload (POST/PUT/PATCH).
+    escape the base URL's prefix. `method` is GET, HEAD, POST, PUT, PATCH, DELETE or
+    OPTIONS. `body` is sent as JSON — only use it with methods that accept a payload
+    (POST/PUT/PATCH). `headers` adds request headers; credentials, Host and
+    connection-framing headers are managed by the gateway, and any you send come back
+    listed in `ignored_headers`.
 
     Returns {status, url, body}; JSON bodies come back parsed, others as text,
     truncated at 60k chars. Entries flagged `pii: true` return personal data
@@ -156,36 +182,40 @@ def call_api(
             "hint": entry.notes or entry.docs_url,
         }
 
+    # Validate everything the caller controls before touching credentials, so a bad
+    # call never costs an OAuth2 token request.
+    method = method.upper()
+    if method not in ALLOWED_METHODS:
+        return {
+            "error": f"method {method!r} is not allowed.",
+            "allowed_methods": list(ALLOWED_METHODS),
+        }
+    if body is not None and method in ("GET", "HEAD", "DELETE"):
+        return {
+            "error": f"body is not supported with {method}; "
+            "use query for parameters, or POST if the API expects a payload."
+        }
     try:
+        request_headers, ignored = _caller_headers(entry, headers)
         url, params = _build_target(entry.base_url, path, query)
-    except ValueError as exc:
+        # Dry run: surfaces what httpx cannot encode (query, body) before any credential.
+        _client.build_request(method, url, params=params, json=body, headers=request_headers)
+    except (ValueError, httpx.InvalidURL) as exc:
         return {"error": str(exc)}
 
-    # Caller headers first, then auth: the managed credential always wins.
-    request_headers = {"Accept": "application/json"}
-    rejected = sorted(h for h in (headers or {}) if h.lower() in PROTECTED_HEADERS)
-    if headers:
-        request_headers.update(
-            {k: v for k, v in headers.items() if k.lower() not in PROTECTED_HEADERS}
-        )
+    # The managed credential goes last, so it always wins.
     try:
         request_headers.update(auth_module.build_headers(entry, _client))
     except auth_module.MissingCredentialsError as exc:
         return {"error": str(exc), "credentials": auth_module.credentials_status(entry)}
 
-    if body is not None and method.upper() in ("GET", "HEAD", "DELETE"):
-        return {
-            "error": f"body is not supported with {method.upper()}; "
-            "use query for parameters, or POST if the API expects a payload."
-        }
-
     try:
-        result = _send(method.upper(), url, params, body, request_headers)
+        result = _send(method, url, params, body, request_headers)
     except httpx.HTTPError as exc:
         return {"error": f"{type(exc).__name__}: {exc}", "url": url}
 
-    if rejected:
-        result["ignored_headers"] = rejected
+    if ignored:
+        result["ignored_headers"] = ignored
     return result
 
 
@@ -205,6 +235,33 @@ def credentials_status(api_id: str | None = None) -> list[dict[str, Any]]:
     return [{"id": e.id, "status": e.status, **auth_module.credentials_status(e)} for e in entries]
 
 
+def _caller_headers(
+    entry: ApiEntry, headers: dict[str, str] | None
+) -> tuple[httpx.Headers, list[str]]:
+    """Gateway default headers plus the caller's, minus the protected ones.
+
+    httpx.Headers compares names case-insensitively, so `Chave-Api-Dados` and
+    `CHAVE-API-DADOS` cannot both ride along next to the managed credential. Returns
+    the headers and the sorted names that were ignored; a header httpx or the wire
+    would refuse raises ValueError.
+    """
+    merged = httpx.Headers({"Accept": "application/json", "Accept-Encoding": "identity"})
+    managed = (entry.auth_config.get("header") or "").lower()
+    ignored: list[str] = []
+    for name, value in (headers or {}).items():
+        lowered = name.lower()
+        if lowered in PROTECTED_HEADERS or lowered.startswith("x-forwarded-") or lowered == managed:
+            ignored.append(name)
+        elif HEADER_NAME_RE.fullmatch(name) and HEADER_VALUE_RE.fullmatch(value):
+            merged[name] = value
+        else:
+            raise ValueError(
+                f"header {name!r} is not valid — names must be HTTP tokens and "
+                "values printable ASCII (no line breaks)."
+            )
+    return merged, sorted(ignored)
+
+
 def _build_target(
     base_url: str, path: str, query: dict[str, Any] | None
 ) -> tuple[str, dict[str, Any]]:
@@ -221,7 +278,10 @@ def _build_target(
             f"path {path!r} contains '..' — pass a path relative to the API's base URL."
         )
     base = httpx.URL(base_url)
-    candidate = httpx.URL(str(base).rstrip("/") + "/" + raw_path.lstrip("/"))
+    try:
+        candidate = httpx.URL(str(base).rstrip("/") + "/" + raw_path.lstrip("/"))
+    except httpx.InvalidURL as exc:  # control characters, over-long paths: not a ValueError
+        raise ValueError(f"path is not a valid URL path: {exc}") from None
 
     # Compare after percent-decoding *and* collapsing dot segments: %2e%2e reaches the
     # remote server encoded, and some servers decode it back into a traversal.
@@ -240,7 +300,7 @@ def _build_target(
 
 
 def _send(
-    method: str, url: str, params: dict[str, Any], body: Any, headers: dict[str, str]
+    method: str, url: str, params: dict[str, Any], body: Any, headers: httpx.Headers
 ) -> dict[str, Any]:
     """Stream the response so an oversized payload is cut at the wire, not in memory."""
     with _client.stream(method, url, params=params, json=body, headers=headers) as resp:
