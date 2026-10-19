@@ -31,24 +31,27 @@ flow is already implemented (Serpro uses the same one).
 
 - `search_catalog(query, category?)` — accent-insensitive keyword search; reports total
   matches and whether the list was truncated.
-- `list_apis(category?, status?, limit?)` — enumerate entries, callable ones first (filter
-  it: ~95 Conecta stubs otherwise dominate the output).
+- `list_apis(category?, status?, limit?)` — enumerate entries, callable ones first (by the
+  catalog's status, not by whether your credentials are set; filter it: ~95 Conecta stubs
+  otherwise dominate the output).
 - `describe_api(api_id, path?, method?)` — catalog metadata + OpenAPI operation list;
   with `path`, parameter/request/response schemas ($refs inlined, depth-limited). Reads
   OpenAPI 3 and Swagger 2.0, as JSON or YAML.
 - `call_api(api_id, path, method?, query?, body?, headers?)` — invoke an endpoint; base URL
   and auth resolved from the catalog entry.
   - `method` is GET, HEAD, POST, PUT, PATCH, DELETE or OPTIONS; anything else returns an
-    error with `allowed_methods`.
+    error with `allowed_methods`. A `body` is accepted only with POST, PUT and PATCH.
   - `path` is relative to the `base_url`. `.` and `..` segments (after up to three rounds of
     percent-decoding, with `\` read as `/` and `;` parameters removed) and any path that
-    leaves the `base_url` prefix are rejected.
+    leaves the `base_url` prefix are rejected. So is a `#` (a fragment is never sent; write a
+    literal one as `%23`) or a control character.
   - A query string embedded in `path` is merged with `query`; a key in `query` replaces the
     embedded one, and a list value repeats the key.
   - Caller headers are matched case-insensitively, with `_` equal to `-`. `Authorization`,
     `Proxy-Authorization`, `Host`, `Cookie` and `Accept-Encoding`, plus connection, proxy,
     forwarding and method-override headers, are dropped and reported in `ignored_headers`
     (the full list is in `server.py`). The managed credential is applied last and always wins.
+    A header with an invalid name or value is not ignored: it fails the call with an `error`.
   - Method, body, headers and path are validated before any OAuth2 token is requested, and
     invalid input comes back as `{"error": ...}`.
   - A `3xx` is not followed: the response carries its `location` (redacted, resolved
@@ -98,8 +101,9 @@ docker build -t govbr-apis-mcp . && docker run -i --rm -e TRANSPARENCIA_API_KEY=
 ## Credentials
 
 All secrets come from env vars declared per entry in the catalog (`auth_config`).
-Nothing is stored in the repo. `.env.example` lists the variables; each entry's
-`signup_url` says where to get a key. `credentials_status` reports readiness.
+Nothing is stored in the repo. `.env.example` lists the variables. Entries with a free key
+carry a `signup_url`; Serpro credentials come with the contract, at loja.serpro.gov.br.
+`credentials_status` reports readiness.
 
 The server does not read `.env` files, and MCP clients start it with a minimal environment,
 so an `export` in your shell may never reach it. Put the variables in the client's `env`
@@ -108,10 +112,12 @@ block (the example above, or `claude mcp add -e KEY=value`). For a container, co
 with `docker run --env-file .env.local`. Never put real values in `.env.example`: it is
 versioned.
 
-Values are stripped of surrounding whitespace and must be printable ASCII; otherwise the
-call fails with `credential in <VAR> contains invalid characters`, without echoing the
-value. When the OAuth2 token endpoint fails, the call returns an `error` and the
-`token_url`, with neither the response body nor any secret.
+API keys (the value together with any prefix) are stripped of surrounding whitespace and
+must be printable ASCII; otherwise the call fails with `credential in <VAR> contains
+invalid characters`, without echoing the value. OAuth2 client ids and secrets are only
+stripped: they travel base64-encoded, so any text works. The access token the endpoint
+returns must be printable ASCII too. When the token endpoint fails, the call returns an
+`error` and the `token_url`, with neither the response body nor any secret.
 
 Auth profiles: `none`, `api_key` (static header, optional value prefix — e.g.
 DataJud's `APIKey <key>`), `oauth2_client_credentials` (token endpoint + id/secret,
@@ -161,12 +167,17 @@ loads the catalog from a clean install.
   changed `openapi_url` never serves the old spec. OAuth2 tokens live in memory only.
 - `call_api` does not follow redirects — credentialed requests cannot be steered to
   another host by a `3xx`; the response carries the (redacted) `location` instead. It always
-  sends `Accept-Encoding: identity`, so the 60,000-character cut is made on the streamed body.
+  sends `Accept-Encoding: identity`, so a server has no reason to compress. The
+  60,000-character cut counts decoded text, though: a server that compresses anyway can
+  still inflate a small chunk before the cut (an accepted risk; see the roadmap).
+- Cookies an API sets are never stored or sent back, so one API cannot plant a cookie that
+  another would receive.
 - Spec fetches follow redirects only by hand: at most 5 hops, and every URL (the first
   and each `Location`) must be `https` on an allowlisted host before it is requested.
   The body is capped at 5 MiB, JSON and YAML are accepted (YAML with aliases, including
   merge keys that rely on them, is refused), and the document must carry `openapi` or
-  `swagger`.
+  `swagger`. A compressed response is refused and the whole download has a 60-second
+  deadline; both come back as `spec_error`.
 - The `httpx` and `httpcore` loggers stay at WARNING, so httpx logs no request URL (query
   string included).
 - Entries flagged `pii: true` return personal data (CPF, name, photo) into the client

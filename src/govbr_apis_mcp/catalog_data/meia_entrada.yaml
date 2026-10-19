@@ -46,11 +46,11 @@ apis:
     description: >-
       Valida CIE emitida pela FESN, uma das emissoras fora da base DNE.
       GET /api/students/usecode/{codigoUso} — sem autenticação e sem data de
-      nascimento. Retorna useCode, name, cpf, birth, entity (instituição), course,
-      courseType, validity e photo. A resposta só vale com o useCode igual ao
-      consultado e uma validity legível; se o nascimento foi informado, ele precisa
-      conferir com birth. Carteirinha desconhecida volta HTTP 404 com o objeto de
-      erro (name: "NotFoundError"), lido como "não encontrada".
+      nascimento. Retorna name, cpf, birth, entity (instituição), course,
+      courseType, validity e photo. Só vale a resposta com o useCode consultado e uma
+      validity legível (e, se o nascimento foi informado, birth igual a ele); um 404
+      com {"name": "NotFoundError"} é lido como "não encontrada". O useCode no corpo
+      e esse 404 são premissas a confirmar na API real (ver notes).
     tags: [meia-entrada, estudante, cie, eventos, validacao]
     notes: >-
       Verificado em 2026-08-07 com carteirinha real (IFRS) que a base DNE não conhece
@@ -63,6 +63,11 @@ apis:
       fraude: a FESN devolve `birth` sem autenticação, então quem tem o código de uso lê
       a data e a digita de volta. Só o 404 com o objeto de erro esperado vale como
       "não encontrada"; outro 404 ou qualquer status fora de 2xx é "não validado".
+      Premissas a confirmar com uma consulta real (comportamento da FESN observado e
+      relatado durante o desenvolvimento, não gravado neste repositório): o `useCode`
+      consultado vem no corpo e um código desconhecido volta como 404 com
+      `{"name": "NotFoundError"}`. Se divergirem, a resposta vira "não validado",
+      nunca aprovação.
 
   - id: idjovem-validacao
     name: ID Jovem — validação de carteira
@@ -79,9 +84,8 @@ apis:
     tags: [meia-entrada, id-jovem, baixa-renda, jovem]
     notes: >-
       Caminho para integração sistêmica: pleitear a API conecta-id-jovem junto à SNJ
-      (juventude@presidencia.gov.br), mediante aprovação caso a caso. A descrição
-      oficial dela admite instituições públicas e privadas, o que foge da regra geral
-      do Conecta (a da RNDS também cita laboratórios privados).
+      (juventude@presidencia.gov.br) — a descrição oficial dela admite instituições
+      privadas, mediante aprovação caso a caso.
       O validador web é SPA protegida por WAF; endpoint de backend não confirmado.
 
   - id: inss-certificado-pcd
@@ -119,4 +123,3 @@ apis:
     notes: >-
       Verificado em 2026-10-19: emec.mec.gov.br e dadosabertos.mec.gov.br respondem 403 a
       cliente não-browser.
-      Existe scraper não-oficial (github.com/pavanad/emec-api), fora do escopo deste MCP.

@@ -78,6 +78,30 @@
           "description": "Access code (codigoAcesso) for the CIE validator used for meia-entrada, issued to the venue or producer",
           "isRequired": false,
           "isSecret": true
+        },
+        {
+          "name": "GOVBR_CATALOG_DIR",
+          "description": "Directory of catalog YAML files that replaces the packaged catalog (trusted input)",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "GOVBR_EXTRA_CATALOG_DIR",
+          "description": "Directory of catalog YAML files whose entries are added to the catalog, overriding same-id ones",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "GOVBR_EXTRA_ALLOWED_HOSTS",
+          "description": "Comma-separated extra hostnames catalog URLs may use; add one only if you trust it with the credentials sent there",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "XDG_CACHE_HOME",
+          "description": "Base directory of the OpenAPI spec cache (a govbr-apis-mcp folder is created below it); defaults to ~/.cache",
+          "isRequired": false,
+          "isSecret": false
         }
       ]
     }

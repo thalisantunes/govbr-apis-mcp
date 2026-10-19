@@ -12,7 +12,9 @@ checks now fail closed.
 
 - The catalog ships inside the package, in `src/govbr_apis_mcp/catalog_data/`. Wheels,
   `uvx` and the Docker image used to fail with `FileNotFoundError`; now they find it.
-- Package data also covers `*.yml` catalog files.
+- Package data also covers `*.yml` catalog files, and the CI wheel smoke test counts them.
+- The sdist carries `tests/`, `scripts/` and `poc/`, so the test suite passes when run
+  from it.
 - New CI runs ruff, the tests on Python 3.11 to 3.14, and a wheel smoke test. The smoke
   test installs only the wheel and loads the catalog from outside the checkout.
 - Publishing is gated on lint, format, tests and a wheel smoke test. It runs only for a
@@ -20,7 +22,9 @@ checks now fail closed.
 - `twine check --strict` runs in CI and in the publish workflow.
 - The Docker image copies only what the build needs and runs as an unprivileged user.
 - License metadata follows PEP 639 (`License-Expression: MIT`).
-- `server.json` declares all ten credential variables. `mcp` is bounded to `<3`.
+- `server.json` declares all ten credential variables and the four non-secret settings
+  the server reads (`GOVBR_CATALOG_DIR`, `GOVBR_EXTRA_CATALOG_DIR`,
+  `GOVBR_EXTRA_ALLOWED_HOSTS`, `XDG_CACHE_HOME`). `mcp` is bounded to `<3`.
 - `tzdata` is a dependency, because `America/Sao_Paulo` needs a time zone database.
 
 ### Gateway
@@ -33,8 +37,9 @@ checks now fail closed.
   The full list is in `server.py`.
 - The header of the managed credential is blocked for callers too, and the credential is
   applied last, so it always wins.
-- `Accept-Encoding: identity` is fixed, so the 60,000-character cut is made on the
-  streamed body.
+- `Accept-Encoding: identity` is fixed, so a server has no reason to compress. The
+  60,000-character cut counts decoded text: a server that compresses anyway can still
+  inflate a chunk before the cut (an accepted risk).
 - The method, body, headers and path are validated before any OAuth2 token is requested.
   Invalid input comes back as `{"error": ...}`.
 - `path` is relative to the `base_url`. Dot segments are rejected after up to three rounds
@@ -44,9 +49,10 @@ checks now fail closed.
   key from the caller replaces the embedded one.
 - A `3xx` response, which is still not followed, now carries a redacted `location`,
   resolved against the requested URL.
-- Credentials read from the environment are stripped and must be printable ASCII. An
-  invalid value fails with `credential in <VAR> contains invalid characters`, and the value
-  is never echoed.
+- API keys read from the environment are stripped and must be printable ASCII. An invalid
+  value fails with `credential in <VAR> contains invalid characters`, and the value is
+  never echoed. OAuth2 client ids and secrets are only stripped, since they travel
+  base64-encoded; the access token a token endpoint returns must be printable ASCII.
 - A failing token endpoint returns the error and the `token_url`, with no response body
   and no secret.
 - `credentials_status` reports `callable`. Serpro entries are callable once their
@@ -105,8 +111,9 @@ checks now fail closed.
   and FESN as a source of personal data.
 - Fixed the `docs_url` of the INSS PcD certificate and of INMET, which returned 404, and of
   BCB SGS, which pointed at the page of a single series.
-- The FESN entry describes the full verdict rules. The ID Jovem note no longer calls it
-  the only Conecta API open to private institutions.
+- The FESN entry describes the full verdict rules and flags the two readings still to be
+  confirmed on the live API. The ID Jovem note no longer calls it the only Conecta API
+  open to private institutions.
 - The Conecta scraper writes its output atomically. It never replaces the catalog with an
   empty result, an invalid id or fewer than half the current entries (`--force` skips only
   the last check). It also unescapes HTML entities and warns about a card with no agency
@@ -114,7 +121,7 @@ checks now fail closed.
 
 ## [0.1.0] - 2026-09-10
 
-First release.
+Initial version (never published).
 
 - A gateway with five tools: `search_catalog`, `list_apis`, `describe_api`, `call_api` and
   `credentials_status`.
