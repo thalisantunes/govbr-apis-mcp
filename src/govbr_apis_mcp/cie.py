@@ -16,8 +16,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import date, datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 API_ID = "meiaentrada-cie-validador"
 VALIDATOR_PATH = "/public/validador"
@@ -69,6 +70,17 @@ def normalize_date(value: str, field_name: str) -> str:
     return digits
 
 
+def today_br(now: datetime | None = None) -> date:
+    """Today's date in Brazil (America/Sao_Paulo), never UTC's.
+
+    From 21:00 in Brasília the UTC date is already tomorrow: it would refuse a card on the
+    last day of its validity and send tomorrow as the event date. `now` (timezone-aware)
+    exists so tests can pin the clock.
+    """
+    zone = ZoneInfo("America/Sao_Paulo")
+    return (now or datetime.now(zone)).astimezone(zone).date()
+
+
 def build_payload(
     codigo_uso: str,
     data_nascimento: str,
@@ -87,7 +99,7 @@ def build_payload(
         "nomeEvento": (nome_evento or "").strip() or "evento",
         "dataEvento": normalize_date(data_evento, "dataEvento")
         if data_evento
-        else datetime.now(tz=UTC).strftime("%Y%m%d"),
+        else today_br().strftime("%Y%m%d"),
         "cnpjPromotor": cnpj,
     }
 
@@ -190,7 +202,7 @@ def expiry_reference(data_evento: str | None) -> str:
     if data_evento:
         digits = normalize_date(data_evento, "dataEvento")
         return f"{digits[:4]}-{digits[4:6]}-{digits[6:]}"
-    return datetime.now(tz=UTC).strftime("%Y-%m-%d")
+    return today_br().strftime("%Y-%m-%d")
 
 
 def interpret_fesn(

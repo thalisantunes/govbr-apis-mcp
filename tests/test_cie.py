@@ -1,5 +1,9 @@
+from datetime import UTC, date, datetime
+from zoneinfo import ZoneInfo
+
 import pytest
 
+from govbr_apis_mcp import cie
 from govbr_apis_mcp.cie import (
     InvalidInput,
     build_payload,
@@ -8,7 +12,16 @@ from govbr_apis_mcp.cie import (
     interpret,
     interpret_fesn,
     normalize_date,
+    today_br,
 )
+
+TODAY = date(2026, 10, 19)
+
+
+@pytest.fixture(autouse=True)
+def fixed_today(monkeypatch):
+    """No test may depend on the real clock: pin "today" for every test in this module."""
+    monkeypatch.setattr(cie, "today_br", lambda: TODAY)
 
 
 @pytest.mark.parametrize(
@@ -196,3 +209,39 @@ def test_check_any_propagates_event_date_to_fesn():
 
     d = check_any("AB12CD34", "1990-01-01", "Show", "00000000000191", "2026-12-20", fake_call)
     assert not d.eligible
+
+
+# --- "today" is the Brazilian civil date, and injectable ------------------------
+
+
+@pytest.mark.parametrize(
+    "now,expected",
+    [
+        # 23:30 in Brasília is already tomorrow in UTC — the case that used to break
+        (datetime(2026, 12, 21, 2, 30, tzinfo=UTC), date(2026, 12, 20)),
+        (datetime(2026, 12, 20, 23, 30, tzinfo=ZoneInfo("America/Sao_Paulo")), date(2026, 12, 20)),
+        (datetime(2026, 12, 21, 2, 59, tzinfo=UTC), date(2026, 12, 20)),
+        (datetime(2026, 12, 21, 3, 0, tzinfo=UTC), date(2026, 12, 21)),  # midnight in Brasília
+    ],
+)
+def test_today_br_is_the_brazilian_date_not_utc(now, expected):
+    assert today_br(now) == expected
+
+
+def test_default_event_date_is_the_brazilian_today(monkeypatch):
+    late_evening = datetime(2026, 12, 21, 2, 30, tzinfo=UTC)  # 23:30 in Brasília
+    monkeypatch.setattr(cie, "today_br", lambda: today_br(late_evening))
+    body = build_payload("ABC", "20000115", "x", "00000000000191")
+    assert body["dataEvento"] == "20261220"  # UTC would have sent 20261221
+
+
+def test_card_is_still_valid_on_its_last_day_late_in_the_evening(monkeypatch):
+    """After 21:00 in Brasília the UTC date is already tomorrow and refused the card."""
+    late_evening = datetime(2026, 12, 21, 2, 30, tzinfo=UTC)
+    monkeypatch.setattr(cie, "today_br", lambda: today_br(late_evening))
+    assert interpret_fesn({**FESN_OK, "validity": "2026-12-20 23:59:59"}, None).eligible
+    assert interpret({"status": True, "nome": "X", "dataExpiracao": "2026-12-20"}).eligible
+
+
+def test_clock_is_pinned_for_the_whole_module():
+    assert cie.today_br() == TODAY
