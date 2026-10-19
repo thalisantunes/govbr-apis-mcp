@@ -9,15 +9,22 @@ import httpx
 import pytest
 
 from govbr_apis_mcp import __version__, auth, server
-from govbr_apis_mcp.catalog import ApiEntry, Catalog
+from govbr_apis_mcp.catalog import DEFAULT_CATALOG_DIR, ApiEntry, Catalog
 
 BASE = "https://api.portaldatransparencia.gov.br/api-de-dados"
 ALLOWED_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 
 
+@pytest.fixture(autouse=True)
+def _ignore_catalog_env(monkeypatch):
+    """The catalog under test is the packaged one, whatever GOVBR_* the shell exports."""
+    for name in ("GOVBR_CATALOG_DIR", "GOVBR_EXTRA_CATALOG_DIR"):
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture
 def catalog(monkeypatch):
-    loaded = Catalog.load()
+    loaded = Catalog.load(DEFAULT_CATALOG_DIR)
     monkeypatch.setattr(server, "_catalog", loaded)
     return loaded
 
@@ -293,7 +300,7 @@ def test_result_url_hides_credential_like_query_values(catalog, wire):
 
 
 def test_call_api_blocks_not_callable(monkeypatch):
-    monkeypatch.setattr(server, "_catalog", Catalog.load())
+    monkeypatch.setattr(server, "_catalog", Catalog.load(DEFAULT_CATALOG_DIR))
     out = server.call_api("conecta-consulta-cnpj", "/basica/1")
     assert "not callable" in out["error"]
 
@@ -339,7 +346,7 @@ def test_requires_contract_api_without_credentials_says_which_are_missing(
 def test_requires_contract_api_without_base_url_stays_not_callable(monkeypatch, wire):
     for var in SERPRO_ENV:
         monkeypatch.setenv(var, "x")
-    entry = dataclasses.replace(Catalog.load().get(SERPRO_CNPJ), base_url=None)
+    entry = dataclasses.replace(Catalog.load(DEFAULT_CATALOG_DIR).get(SERPRO_CNPJ), base_url=None)
     monkeypatch.setattr(server, "_catalog", Catalog({entry.id: entry}))
     requests = wire()
     out = server.call_api(SERPRO_CNPJ, "/basica/00000000000191")
@@ -415,7 +422,7 @@ def test_cookies_are_never_stored_or_replayed(catalog, wire):
 
 
 def test_call_api_unknown_id_returns_error_dict(monkeypatch):
-    monkeypatch.setattr(server, "_catalog", Catalog.load())
+    monkeypatch.setattr(server, "_catalog", Catalog.load(DEFAULT_CATALOG_DIR))
     out = server.call_api("nao-existe-xyz", "/x")
     assert "error" in out and "Unknown API id" in out["error"]
 
@@ -691,8 +698,6 @@ def test_invalid_input_is_an_error_before_any_request(kwargs, oauth_api, wire):
 def unloadable_catalog(request, monkeypatch, tmp_path):
     """Three ways the catalog can fail to load, none of which every tool used to survive."""
     monkeypatch.setattr(server, "_catalog", None)
-    monkeypatch.delenv("GOVBR_CATALOG_DIR", raising=False)
-    monkeypatch.delenv("GOVBR_EXTRA_CATALOG_DIR", raising=False)
     if request.param == "no-yaml-files":
         monkeypatch.setenv("GOVBR_CATALOG_DIR", str(tmp_path))
         return
@@ -719,14 +724,14 @@ def test_every_tool_reports_a_catalog_that_will_not_load(call, unloadable_catalo
 
 
 def test_search_catalog_reports_truncation(monkeypatch):
-    monkeypatch.setattr(server, "_catalog", Catalog.load())
+    monkeypatch.setattr(server, "_catalog", Catalog.load(DEFAULT_CATALOG_DIR))
     out = server.search_catalog("consulta")
     assert out["total_matches"] >= out["shown"]
     assert out["truncated"] is (out["total_matches"] > out["shown"])
 
 
 def test_list_apis_invalid_filter_explains(monkeypatch):
-    monkeypatch.setattr(server, "_catalog", Catalog.load())
+    monkeypatch.setattr(server, "_catalog", Catalog.load(DEFAULT_CATALOG_DIR))
     out = server.list_apis(category="Public")
     assert "error" in out and "public" in out["valid_categories"]
 

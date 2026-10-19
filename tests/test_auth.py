@@ -10,9 +10,16 @@ import httpx
 import pytest
 
 from govbr_apis_mcp import auth
-from govbr_apis_mcp.catalog import Catalog
+from govbr_apis_mcp.catalog import DEFAULT_CATALOG_DIR, Catalog
 
 TOKEN_URL = "https://gateway.apiserpro.serpro.gov.br/token"
+
+
+@pytest.fixture(autouse=True)
+def _ignore_catalog_env(monkeypatch):
+    """The catalog under test is the packaged one, whatever GOVBR_* the shell exports."""
+    for name in ("GOVBR_CATALOG_DIR", "GOVBR_EXTRA_CATALOG_DIR"):
+        monkeypatch.delenv(name, raising=False)
 
 
 @pytest.fixture
@@ -21,7 +28,7 @@ def entry(monkeypatch):
     monkeypatch.setenv("SERPRO_CNPJ_CLIENT_ID", "the-id")
     monkeypatch.setenv("SERPRO_CNPJ_CLIENT_SECRET", "the-secret")
     monkeypatch.setattr(auth, "_token_cache", {})
-    return Catalog.load().get("serpro-consulta-cnpj")
+    return Catalog.load(DEFAULT_CATALOG_DIR).get("serpro-consulta-cnpj")
 
 
 @pytest.fixture
@@ -29,7 +36,7 @@ def cpf_entry(monkeypatch):
     """serpro-consulta-cpf: a second OAuth2 API, with credentials of its own."""
     monkeypatch.setenv("SERPRO_CPF_CLIENT_ID", "cpf-id")
     monkeypatch.setenv("SERPRO_CPF_CLIENT_SECRET", "cpf-secret")
-    return Catalog.load().get("serpro-consulta-cpf")
+    return Catalog.load(DEFAULT_CATALOG_DIR).get("serpro-consulta-cpf")
 
 
 @pytest.fixture
