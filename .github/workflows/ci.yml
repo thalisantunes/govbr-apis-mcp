@@ -10,13 +10,15 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -32,6 +34,8 @@ jobs:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
@@ -42,6 +46,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -59,19 +65,22 @@ jobs:
           wheel-venv/bin/pip install "$GITHUB_WORKSPACE"/dist/*.whl
           wheel-venv/bin/python -I - <<'PY'
           import os
+          import sys
           from pathlib import Path
 
           import yaml
 
           from govbr_apis_mcp.catalog import DEFAULT_CATALOG_DIR, Catalog
 
-          tree = Path(os.environ["GITHUB_WORKSPACE"]) / "src/govbr_apis_mcp/catalog"
+          tree = Path(os.environ["GITHUB_WORKSPACE"]) / "src/govbr_apis_mcp/catalog_data"
           expected = sum(
               len((yaml.safe_load(path.read_text(encoding="utf-8")) or {}).get("apis", []))
               for path in tree.glob("*.yaml")
           )
-          count = len(Catalog.load().list())
+          # Explicit directory: a bare load() would obey GOVBR_CATALOG_DIR.
+          count = len(Catalog.load(DEFAULT_CATALOG_DIR).list())
           print(f"{count} entries loaded from {DEFAULT_CATALOG_DIR}; source tree has {expected}")
           assert "site-packages" in str(DEFAULT_CATALOG_DIR), "catalog did not come from the wheel"
+          assert Path(DEFAULT_CATALOG_DIR).is_relative_to(sys.prefix), "catalog is outside the venv"
           assert count == expected, f"wheel has {count} entries, source tree has {expected}"
           PY

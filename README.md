@@ -13,10 +13,10 @@ API's OpenAPI spec on demand.
 
 | Tier | File | Access model | Callable today? |
 |------|------|--------------|-----------------|
-| `public` | `src/govbr_apis_mcp/catalog/public.yaml` | Free — no auth or free API key (IBGE, Banco Central, Câmara, Senado, Portal da Transparência, DataJud, Ipeadata, dados.gov.br…) | Yes |
-| `serpro` | `src/govbr_apis_mcp/catalog/serpro.yaml` | Serpro commercial (loja.serpro.gov.br) — OAuth2 client credentials per contracted API, paid per call | With a Serpro contract |
-| `meia-entrada` | `src/govbr_apis_mcp/catalog/meia_entrada.yaml` | Eligibility sources for half-price tickets (student CIE, ID Jovem, PcD, e-MEC) — see [docs/meia-entrada.md](docs/meia-entrada.md) | CIE yes; the rest is manual |
-| `conecta` | `src/govbr_apis_mcp/catalog/conecta.yaml` | [Conecta gov.br](https://www.gov.br/conecta/catalogo/) — **restricted to public-sector entities**; 95 APIs indexed as stubs for discovery | Not yet (adhesion pending) |
+| `public` | `src/govbr_apis_mcp/catalog_data/public.yaml` | Free — no auth or free API key (IBGE, Banco Central, Câmara, Senado, Portal da Transparência, DataJud, Ipeadata, dados.gov.br…) | Yes |
+| `serpro` | `src/govbr_apis_mcp/catalog_data/serpro.yaml` | Serpro commercial (loja.serpro.gov.br) — OAuth2 client credentials per contracted API, paid per call | With a Serpro contract |
+| `meia-entrada` | `src/govbr_apis_mcp/catalog_data/meia_entrada.yaml` | Eligibility sources for half-price tickets (student CIE, ID Jovem, PcD, e-MEC) — see [docs/meia-entrada.md](docs/meia-entrada.md) | CIE yes; the rest is manual |
+| `conecta` | `src/govbr_apis_mcp/catalog_data/conecta.yaml` | [Conecta gov.br](https://www.gov.br/conecta/catalogo/) — **restricted to public-sector entities**; 95 APIs indexed as stubs for discovery | Not yet (adhesion pending) |
 
 The Conecta tier exists so the catalog reflects the whole landscape now, and becomes
 callable later by filling in `base_url` + credentials — the OAuth2 client-credentials
@@ -77,8 +77,8 @@ in-memory token cache; used by Serpro today, by Conecta after adhesion).
 
 ## Extending the catalog
 
-Add an entry to a YAML file in `src/govbr_apis_mcp/catalog/`. Minimum fields: `id`,
-`name`, `provider`, `category`, `status`, `auth`. Add `openapi_url` when the API
+Add an entry to a YAML file in `src/govbr_apis_mcp/catalog_data/`. Minimum fields:
+`id`, `name`, `provider`, `category`, `status`, `auth`. Add `openapi_url` when the API
 publishes a spec — `describe_api` then works with zero code. Regenerate the Conecta
 tier with `python scripts/scrape_conecta.py`.
 
@@ -102,8 +102,8 @@ python3 -m venv .venv
 .venv/bin/pytest
 ```
 
-CI runs the same checks on Python 3.11–3.14. It also builds the wheel, installs it in a
-clean environment and loads the catalog from the installed package.
+CI runs ruff on Python 3.12 and the test suite on 3.11–3.14, then builds the wheel and
+loads the catalog from a clean install.
 
 ## Security notes
 

@@ -26,7 +26,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
-    "ruff>=0.15",
+    "ruff>=0.17,<0.18",
 ]
 
 [project.urls]
@@ -45,7 +45,7 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.setuptools.package-data]
-govbr_apis_mcp = ["catalog/*.yaml"]
+govbr_apis_mcp = ["catalog_data/*.yaml"]
 
 [tool.ruff]
 line-length = 100
