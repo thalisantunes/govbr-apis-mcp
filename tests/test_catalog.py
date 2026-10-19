@@ -15,7 +15,10 @@ from govbr_apis_mcp.openapi import describe_operation, summarize_spec
 
 @pytest.fixture(scope="module")
 def catalog() -> Catalog:
-    return Catalog.load()
+    """The packaged catalog, whatever GOVBR_* variables the developer's shell exports."""
+    with pytest.MonkeyPatch.context() as env:
+        env.delenv("GOVBR_EXTRA_CATALOG_DIR", raising=False)
+        return Catalog.load(DEFAULT_CATALOG_DIR)
 
 
 def test_catalog_loads_all_categories(catalog: Catalog):
@@ -225,6 +228,48 @@ def test_extra_catalog_files_without_entries_are_an_error(content, tmp_path, cle
         Catalog.load()
 
 
+def test_a_base_dir_without_entries_is_an_error(tmp_path, clean_env):
+    (tmp_path / "empty").mkdir()
+    with pytest.raises(FileNotFoundError, match="No catalog YAML files"):
+        Catalog.load(tmp_path / "empty")
+
+
+def test_govbr_catalog_dir_replaces_the_packaged_catalog(tmp_path, clean_env):
+    write_catalog(tmp_path / "mine", "one.yaml", demo_entry())
+    clean_env.setenv("GOVBR_CATALOG_DIR", str(tmp_path / "mine"))
+    assert [e.id for e in Catalog.load().list()] == ["demo"]
+    # an explicit directory beats the variable
+    packaged = {e.id for e in Catalog.load(DEFAULT_CATALOG_DIR).list()}
+    assert "brasilapi" in packaged and "demo" not in packaged
+
+
+@pytest.mark.parametrize(
+    ("content", "problem"),
+    [
+        ("- id: demo\n", "got list"),
+        ("[]\n", "got list"),
+        ("just text\n", "got str"),
+        ("42\n", "got int"),
+        ("apis: [unclosed\n", "not valid YAML"),
+        ("apis: []\n---\napis: []\n", "not valid YAML"),
+    ],
+)
+def test_a_malformed_catalog_file_is_a_value_error_that_names_it(
+    content, problem, tmp_path, clean_env
+):
+    (tmp_path / "base").mkdir()
+    (tmp_path / "base" / "broken.yml").write_text(content, encoding="utf-8")
+    with pytest.raises(ValueError, match=rf"broken\.yml: .*{problem}"):
+        Catalog.load(tmp_path / "base")
+
+
+def test_list_rejects_unknown_filters(catalog: Catalog):
+    with pytest.raises(ValueError, match="Unknown status 'nope'"):
+        catalog.list(status="nope")
+    with pytest.raises(ValueError, match="Unknown category 'nope'"):
+        catalog.list(category="nope")
+
+
 REJECTED_ENTRIES = [
     # every URL must be https ...
     ({"base_url": "http://api.demo.gov.br/v1"}, "base_url must use https"),
@@ -306,6 +351,31 @@ def test_validate_accepts_well_formed_entries(clean_env):
         ApiEntry(**demo_entry(**fields)).validate("test.yaml")
 
 
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://api_x.demo.gov.br/v1",
+        "https://münchen.gov.br/v1",
+        "https://exa;mple.gov.br/v1",
+        "https:///v1",
+    ],
+)
+def test_validate_explains_the_hostname_rule_instead_of_the_allowlist(base_url, clean_env):
+    """GOVBR_EXTRA_ALLOWED_HOSTS cannot make such a host valid, so it must not be suggested."""
+    entry = ApiEntry(**demo_entry(base_url=base_url))
+    with pytest.raises(
+        ValueError, match="lowercase ASCII letters, digits, dots and hyphens"
+    ) as err:
+        entry.validate("test.yaml")
+    assert "GOVBR_EXTRA_ALLOWED_HOSTS" not in str(err.value)
+
+
+def test_validate_points_at_the_extra_hosts_for_a_valid_hostname_that_is_not_listed(clean_env):
+    entry = ApiEntry(**demo_entry(base_url="https://api.example.org/v1"))
+    with pytest.raises(ValueError, match="GOVBR_EXTRA_ALLOWED_HOSTS"):
+        entry.validate("test.yaml")
+
+
 def test_extra_allowed_host_lets_an_entry_validate(clean_env):
     entry = ApiEntry(**demo_entry(base_url="https://api.example.org/v1"))
     with pytest.raises(ValueError, match="not allowlisted"):
@@ -347,6 +417,7 @@ HOST_CASES = [
     ("https://sub.brasilapi.com.br/x", False),
     # a trailing dot (rooted FQDN) is refused: conservative, and nothing in the catalog needs it
     ("https://sub.gov.br./x", False),
+    ("https://a_b.gov.br/x", False),
     # a hostname is plain ASCII letters, digits, dots and hyphens: junk before an allowed
     # suffix is no subdomain, whatever a resolver would make of it
     ("https://evil.com;.gov.br/x", False),

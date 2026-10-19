@@ -59,11 +59,16 @@ def extra_allowed_hosts() -> set[str]:
     return {h.strip().lower() for h in raw.split(",") if h.strip()}
 
 
-def host_allowed(url: str) -> bool:
+def _hostname(url: str) -> str:
+    """The lowercased hostname of a URL; empty when it has none or cannot be parsed."""
     try:
-        host = (urlsplit(url).hostname or "").lower()
-    except ValueError:  # malformed URL, e.g. an unclosed IPv6 bracket: fail closed
-        return False
+        return (urlsplit(url).hostname or "").lower()
+    except ValueError:  # malformed URL, e.g. an unclosed IPv6 bracket
+        return ""
+
+
+def host_allowed(url: str) -> bool:
+    host = _hostname(url)
     if not HOSTNAME_RE.fullmatch(host):
         return False
     if host in ALLOWED_HOSTS or host in extra_allowed_hosts():
@@ -121,6 +126,12 @@ class ApiEntry:
             if not url.startswith("https://"):
                 raise ValueError(f"{where}: {field_name} must use https — got {url!r}")
             if not host_allowed(url):
+                if not HOSTNAME_RE.fullmatch(_hostname(url)):
+                    # GOVBR_EXTRA_ALLOWED_HOSTS cannot make such a host valid: do not suggest it
+                    raise ValueError(
+                        f"{where}: {field_name} hostname is not valid ({url!r}): hostnames must "
+                        "be lowercase ASCII letters, digits, dots and hyphens (IDN in punycode)"
+                    )
                 raise ValueError(
                     f"{where}: {field_name} host is not allowlisted ({url!r}). "
                     "Add it to GOVBR_EXTRA_ALLOWED_HOSTS only if you trust it with "
@@ -209,8 +220,16 @@ class Catalog:
     def _load_dir(directory: Path) -> dict[str, ApiEntry]:
         entries: dict[str, ApiEntry] = {}
         for path in sorted([*directory.glob("*.yaml"), *directory.glob("*.yml")]):
-            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-            for raw in data.get("apis") or []:
+            try:
+                data = yaml.safe_load(path.read_text(encoding="utf-8"))
+            except yaml.YAMLError as exc:
+                raise ValueError(f"{path.name}: not valid YAML — {exc}") from None
+            if data is not None and not isinstance(data, dict):  # None is an empty file
+                raise ValueError(
+                    f"{path.name}: expected a mapping with an `apis:` list at the top, "
+                    f"got {type(data).__name__}"
+                )
+            for raw in (data or {}).get("apis") or []:
                 try:
                     entry = ApiEntry(**raw)
                 except TypeError as exc:
