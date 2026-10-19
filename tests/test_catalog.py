@@ -2,7 +2,14 @@ import pytest
 import yaml
 
 from govbr_apis_mcp import auth
-from govbr_apis_mcp.catalog import DEFAULT_CATALOG_DIR, STATUSES, ApiEntry, Catalog
+from govbr_apis_mcp.catalog import (
+    DEFAULT_CATALOG_DIR,
+    STATUSES,
+    ApiEntry,
+    Catalog,
+    extra_allowed_hosts,
+    host_allowed,
+)
 from govbr_apis_mcp.openapi import describe_operation, summarize_spec
 
 
@@ -203,10 +210,46 @@ def test_base_dir_reads_yml_too_and_duplicates_across_extensions_fail(tmp_path, 
 
 
 REJECTED_ENTRIES = [
-    # auth=api_key needs the env var name, or the key can never be found
-    ({"auth": "api_key", "auth_config": {"header": "X-Key"}}, "requires auth_config.env"),
+    # every URL must be https ...
+    ({"base_url": "http://api.demo.gov.br/v1"}, "base_url must use https"),
+    ({"openapi_url": "http://api.demo.gov.br/spec.json"}, "openapi_url must use https"),
+    ({"docs_url": "http://api.demo.gov.br/docs"}, "docs_url must use https"),
+    ({"base_url": "//api.demo.gov.br/v1"}, "base_url must use https"),
+    (
+        {
+            "auth": "oauth2_client_credentials",
+            "auth_config": {"token_url": "http://a.demo.gov.br/t"},
+        },
+        "token_url not https/allowlisted",
+    ),
+    # ... and point at an allowlisted host
+    ({"base_url": "https://api.evil.com/v1"}, "base_url host is not allowlisted"),
+    ({"base_url": "https://notgov.br/v1"}, "base_url host is not allowlisted"),
+    ({"openapi_url": "https://api.evil.com/spec.json"}, "openapi_url host is not allowlisted"),
+    ({"docs_url": "https://api.evil.com/docs"}, "docs_url host is not allowlisted"),
+    (
+        {"auth": "oauth2_client_credentials", "auth_config": {"token_url": "https://evil.com/t"}},
+        "token_url not https/allowlisted",
+    ),
+    # ids become cache and file names
+    ({"id": "Bad Id"}, "invalid id"),
+    ({"id": "../etc/passwd"}, "invalid id"),
+    ({"id": ""}, "invalid id"),
+    ({"id": "-leading-dash"}, "invalid id"),
     # re.match with "$" lets a trailing newline through
     ({"id": "ibge\n"}, "invalid id"),
+    # closed vocabularies
+    ({"category": "nope"}, "category='nope'"),
+    ({"status": "nope"}, "status='nope'"),
+    ({"auth": "nope"}, "auth='nope'"),
+    # auth profiles need what auth.py reads
+    ({"auth": "api_key", "auth_config": {"env": "X_KEY"}}, "requires auth_config.header"),
+    # auth=api_key needs the env var name, or the key can never be found
+    ({"auth": "api_key", "auth_config": {"header": "X-Key"}}, "requires auth_config.env"),
+    ({"auth": "oauth2_client_credentials"}, "callable oauth2 entry requires auth_config.token_url"),
+    # callable statuses need somewhere to call
+    ({"status": "available", "base_url": None}, "status=available requires base_url"),
+    ({"status": "unstable", "base_url": None}, "status=unstable requires base_url"),
 ]
 
 
@@ -225,3 +268,96 @@ def test_list_puts_callable_entries_first(catalog: Catalog):
     assert not any(e.callable for e in entries[callables:])
     for block in (entries[:callables], entries[callables:]):
         assert block == sorted(block, key=lambda e: (e.category, e.id))
+
+
+def test_unknown_entry_field_is_rejected(tmp_path, clean_env):
+    write_catalog(tmp_path / "base", "x.yaml", demo_entry(colour="red"))
+    with pytest.raises(ValueError, match="invalid entry fields"):
+        Catalog.load(tmp_path / "base")
+
+
+def test_validate_accepts_well_formed_entries(clean_env):
+    api_key = {"header": "X-Key", "env": "X_KEY"}
+    oauth = {"token_url": "https://auth.demo.gov.br/token"}
+    for fields in (
+        {},
+        {"auth": "api_key", "auth_config": api_key},
+        {"auth": "oauth2_client_credentials", "auth_config": oauth},
+        {"openapi_url": "https://api.demo.gov.br/spec.json", "docs_url": "https://demo.gov.br/d"},
+        # a stub: nothing to call yet, so no base_url and no token_url required
+        {"status": "requires_public_entity", "base_url": None, "auth": "oauth2_client_credentials"},
+    ):
+        ApiEntry(**demo_entry(**fields)).validate("test.yaml")
+
+
+def test_extra_allowed_host_lets_an_entry_validate(clean_env):
+    entry = ApiEntry(**demo_entry(base_url="https://api.example.org/v1"))
+    with pytest.raises(ValueError, match="not allowlisted"):
+        entry.validate("test.yaml")
+    clean_env.setenv("GOVBR_EXTRA_ALLOWED_HOSTS", "api.example.org")
+    entry.validate("test.yaml")
+
+
+# --- host allowlist -----------------------------------------------------------------------
+
+HOST_CASES = [
+    # allowed: the suffix tuple, with any depth of subdomains
+    ("https://sub.gov.br/x", True),
+    ("https://a.b.sub.gov.br/x", True),
+    ("https://sub.leg.br/x", True),
+    ("https://sub.jus.br/x", True),
+    # allowed: exact-match entries
+    ("https://brasilapi.com.br/api", True),
+    # case, port and userinfo do not change which host is meant
+    ("https://SUB.GOV.BR/x", True),
+    ("https://sub.gov.br:8443/x", True),
+    ("https://evil.com@sub.gov.br/x", True),
+    # the scheme is not host_allowed's job: validate and fetch_spec require https themselves
+    ("http://sub.gov.br/x", True),
+    # a suffix needs its dot, and a host must not merely contain an allowed name
+    ("https://notgov.br/x", False),
+    ("https://evilgov.br/x", False),
+    ("https://gov.br.evil.com/x", False),
+    ("https://sub.gov.br.evil.com/x", False),
+    ("https://evil.com/sub.gov.br", False),
+    ("https://evil.com/?next=sub.gov.br", False),
+    ("https://evil.com/#sub.gov.br", False),
+    ("https://sub.gov.br%2eevil.com/x", False),
+    # userinfo can name an allowed host while the real one is another
+    ("https://sub.gov.br@evil.com/x", False),
+    ("https://sub.gov.br:443@evil.com/x", False),
+    ("https://sub.gov.br\\@evil.com/x", False),
+    # exact-match entries do not cover their subdomains
+    ("https://sub.brasilapi.com.br/x", False),
+    # a trailing dot (rooted FQDN) is refused: conservative, and nothing in the catalog needs it
+    ("https://sub.gov.br./x", False),
+    # not URLs with a host at all
+    ("sub.gov.br/x", False),
+    ("https:///x", False),
+    ("not a url", False),
+    ("", False),
+]
+
+
+@pytest.mark.parametrize(("url", "allowed"), HOST_CASES)
+def test_host_allowed(url, allowed, clean_env):
+    assert host_allowed(url) is allowed
+
+
+def test_extra_allowed_hosts_are_trimmed_lowercased_and_split_on_commas(clean_env):
+    assert extra_allowed_hosts() == set()
+    clean_env.setenv("GOVBR_EXTRA_ALLOWED_HOSTS", "")
+    assert extra_allowed_hosts() == set()
+    clean_env.setenv("GOVBR_EXTRA_ALLOWED_HOSTS", "  Example.org , other.test,, ,\tthird.test ")
+    assert extra_allowed_hosts() == {"example.org", "other.test", "third.test"}
+
+
+def test_extra_allowed_hosts_are_exact_matches_on_top_of_the_built_in_list(clean_env):
+    assert not host_allowed("https://example.org/x")
+    clean_env.setenv("GOVBR_EXTRA_ALLOWED_HOSTS", " Example.org , other.test ")
+    assert host_allowed("https://example.org/x")
+    assert host_allowed("https://EXAMPLE.ORG/x")
+    assert host_allowed("https://other.test/x")
+    assert host_allowed("https://sub.gov.br/x")  # the built-in list still applies
+    assert not host_allowed("https://sub.example.org/x")  # exact host, no subdomains
+    assert not host_allowed("https://notexample.org/x")
