@@ -6,19 +6,19 @@
 
 MCP server that turns Brazilian government APIs into Claude-callable tools through a
 **catalog-driven gateway**: instead of one tool per endpoint (hundreds — would blow up
-client context), five generic tools operate over a local YAML catalog of 116 APIs.
+client context), five generic tools operate over a local YAML catalog of 121 APIs.
 
 Only the entries that declare an `openapi_url` have a spec to load: today the Câmara dos
-Deputados and the Portal da Transparência, 2 of the 116. For those, `describe_api` loads
-the OpenAPI spec on demand. Every other callable entry (see the "Callable today?" column
-below) is reached through `call_api` alone, using the endpoints in its description and
-`docs_url`.
+Deputados, the Portal da Transparência and the Transferegov TED API, 3 of the 121. For
+those, `describe_api` loads the OpenAPI spec on demand. Every other callable entry (see
+the "Callable today?" column below) is reached through `call_api` alone, using the
+endpoints in its description and `docs_url`.
 
 ## Catalog tiers
 
 | Tier | File | Access model | Callable today? |
 |------|------|--------------|-----------------|
-| `public` | `src/govbr_apis_mcp/catalog_data/public.yaml` | Free — no auth or free API key (IBGE, Banco Central, Câmara, Senado, Portal da Transparência, DataJud, Ipeadata, dados.gov.br…) | Yes |
+| `public` | `src/govbr_apis_mcp/catalog_data/public.yaml` | Free — no auth or free API key (IBGE, Banco Central, Câmara, Senado, Portal da Transparência, DataJud, Ipeadata, PNCP, Transferegov, CAPES, dados.gov.br…) | Yes (INEP downloads are `manual_only`) |
 | `serpro` | `src/govbr_apis_mcp/catalog_data/serpro.yaml` | Serpro commercial (loja.serpro.gov.br) — OAuth2 client credentials per contracted API, paid per call | With a Serpro contract: set the `SERPRO_*` variables |
 | `meia-entrada` | `src/govbr_apis_mcp/catalog_data/meia_entrada.yaml` | Eligibility sources for half-price tickets (student CIE, ID Jovem, PcD, e-MEC) — see [docs/meia-entrada.md](docs/meia-entrada.md) and the [POC](poc/README.md) | CIE yes (DNE and FESN); the rest is manual |
 | `conecta` | `src/govbr_apis_mcp/catalog_data/conecta.yaml` | [Conecta gov.br](https://www.gov.br/conecta/catalogo/) — **restricted to public-sector entities**; 95 APIs indexed as stubs for discovery | Not yet (adhesion pending) |

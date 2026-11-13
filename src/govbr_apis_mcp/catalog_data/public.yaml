@@ -25,7 +25,24 @@ apis:
     description: >-
       Séries estatísticas do IBGE (censos, PNAD, inflação, PIB municipal etc.) via
       agregados/variáveis/localidades. Ex.: GET /{agregado}/periodos/{periodo}/variaveis/{variavel}.
+      Query: localidades=N1[all] | N3[all] | N6[all] | N6[N3[51]] | N6[5103403] (N1 Brasil, N3 UF,
+      N6 município); classificacao=2[6794]|287[93085,6572] (classificações separadas por "|",
+      categorias por ","); períodos separados por "|" (2016|2017) ou -1 para o último.
+      Os colchetes devem ir literais ou como %5B/%5D (no curl, use -g).
+      N6[all] é grande (~0,7 MB para a tabela 6579 em um período, acima do corte de 60.000
+      caracteres do call_api): prefira N6[N3[uf]] ou municípios específicos. N6[all] com muitos
+      períodos ou classificações pode devolver HTTP 500 do IBGE.
+      GET /{agregado}/metadados lista variáveis, classificações e níveis. Valores vêm como string
+      e "-", "X" ou "..." também; nomes de município vêm com sufixo " (UF)".
+      Tabelas úteis: 9514 (Censo 2022, população por idade; var 93; classificacao=287: 93085 = 10 a
+      14 anos, 6572/6573/6574 = 15/16/17 anos, 100362 = total; Brasil, UF e município), 6579
+      (população estimada, var 9324), 5938 (PIB municipal, var 37, mil R$, até 2023; não há PIB per
+      capita), 7342 (PNAD Contínua TIC, domicílios com internet por conexão; Brasil, região, UF e
+      região metropolitana, N7/N14; sem município).
     tags: [estatisticas, censo, sidra, ibge]
+    notes: >-
+      Verificado em 2026-11-13: tabelas 9514, 6579, 5938 e 7342 responderam 200. 6579 em N6[all]
+      devolveu ~0,7 MB; 9514 com N6[all] e 287[all], e 6579 com 24 períodos em N6[all], deram 500.
 
   - id: ibge-nomes
     name: IBGE Nomes
@@ -140,7 +157,17 @@ apis:
     description: >-
       Séries macroeconômicas, regionais e sociais do IPEA em OData.
       Ex.: GET /Metadados, /ValoresSerie(SERCODIGO='PRECOS12_IPCA12').
+      O servidor ignora $filter e $top: a resposta é sempre a série inteira. Séries grandes
+      (ADH_IDHM ~2,4 MB, ADH_T_ANALF15M ~3,4 MB, /Metadados ~7,8 MB) passam do corte de 60.000
+      caracteres do call_api (truncated:true) e não dá para filtrar a série pelo gateway: use
+      call_api só para séries pequenas e baixe as grandes fora do gateway.
+      A resposta mistura níveis, separados por NIVNOME (Municípios, Estados, Regiões, Brasil);
+      TERCODIGO é o código IBGE. Séries sociais: ADH_IDHM, ADH_T_FREQ6A14, ADH_T_FREQ15A17,
+      ADH_T_ANALF15M.
     tags: [economia, series, ipea, odata]
+    notes: >-
+      Verificado em 2026-11-13: $filter e $top ignorados; ADH_T_ANALF15M devolveu 3.412.567 bytes
+      e o call_api truncou em 60.000 caracteres.
 
   - id: inmet-tempo
     name: INMET — API Tempo
@@ -189,3 +216,119 @@ apis:
       disponibilidade: CNPJ (Receita), CEP, feriados, taxas, bancos, DDD, FIPE.
       Ex.: GET /cnpj/v1/{cnpj}, /cep/v2/{cep}. Sem SLA; não usar para dado crítico.
     tags: [cnpj, cep, feriados, comunidade]
+
+  - id: pncp-consulta
+    name: PNCP — Consulta de contratações, itens e resultados
+    provider: Ministério da Gestão e da Inovação (PNCP)
+    category: public
+    status: available
+    auth: none
+    base_url: https://pncp.gov.br/api
+    docs_url: https://pncp.gov.br/api/consulta/swagger-ui/index.html
+    description: >-
+      Portal Nacional de Contratações Públicas (Lei 14.133): contratações, itens e resultados.
+      Somente leitura (GET). A consulta documentada exige dataInicial, dataFinal (AAAAMMDD) e
+      codigoModalidadeContratacao, com tamanhoPagina mínimo 10.
+      Ex.: GET /consulta/v1/contratacoes/publicacao?dataInicial=20260101&dataFinal=20260110
+      &codigoModalidadeContratacao=8&pagina=1&tamanhoPagina=10
+      Itens e resultados de uma compra: GET /pncp/v1/orgaos/{cnpj}/compras/{ano}/{sequencial}/itens
+      (10 por página por padrão; use tamanhoPagina=50) e .../itens/{numeroItem}/resultados.
+      Busca textual, não documentada: GET /search/?q=laboratorio+maker&tipos_documento=edital
+      &pagina=1&tam_pagina=20&status=todos. Aspas na consulta podem derrubar a conexão, e a busca
+      pode fechar a conexão de clientes que não usam o User-Agent do gateway.
+      Dado pessoal: resultados e itens podem trazer fornecedor pessoa física (tipoPessoa PF,
+      niFornecedor = CPF) e MEI com nome de pessoa; não salve nem repasse esses campos sem necessidade.
+    tags: [compras, licitacoes, contratacoes, pncp]
+    notes: >-
+      Verificado em 2026-11-13 (contratações, itens, resultados e /search/ responderam 200).
+      /search/ com o User-Agent govbr-apis-mcp respondeu 200; com User-Agent de curl ou Mozilla a
+      conexão foi fechada em 3 de 3 tentativas. Sem pii: true, por decisão pendente do dono.
+      O spec (/consulta/v3/api-docs) tem paths relativos a /api/consulta, por isso não há
+      openapi_url: não casaria com este base_url.
+
+  - id: transferegov-ted
+    name: Transferegov — Termos de Execução Descentralizada (TED)
+    provider: Ministério da Gestão e da Inovação (Transferegov)
+    category: public
+    status: available
+    auth: none
+    base_url: https://api.transferegov.gestao.gov.br/ted
+    openapi_url: https://api.transferegov.gestao.gov.br/ted/
+    docs_url: https://api.transferegov.gestao.gov.br/ted/
+    description: >-
+      Dados abertos de TED (PostgREST, sem chave, somente leitura): programa, plano_acao, plano_acao_meta,
+      nota_credito, programacao_financeira e outras tabelas listadas no spec. Filtros no estilo
+      PostgREST: ?campo=eq.X, ilike.*txt*, in.(a,b), gte.2024, select=a,b, limit=, offset=.
+      Ex.: GET /plano_acao?limit=1, /nota_credito?tx_observacao_nota=ilike.*2263/25*.
+      nota_credito.tx_observacao_nota traz o número interno do TED ("TED ref.: 2263/25"), elo
+      entre essa numeração e id_plano_acao. Colunas usam prefixos (tx_, vl_, dt_, id_). Chamadas
+      com vários filtros podem demorar mais de 60 s.
+    tags: [transferencias, ted, planos-de-acao, notas-de-credito]
+    notes: >-
+      Verificado em 2026-11-13 (plano_acao, nota_credito, programacao_financeira e programa
+      responderam 200). A raiz devolve o spec Swagger 2.0.
+
+  - id: portal-transparencia-download
+    name: Portal da Transparência — downloads em massa
+    provider: CGU
+    category: public
+    status: available
+    auth: none
+    base_url: https://portaldatransparencia.gov.br/download-de-dados
+    docs_url: https://portaldatransparencia.gov.br/download-de-dados
+    description: >-
+      Arquivos zip (CSV em latin1, separador ";", decimal com vírgula) sem chave, distintos da
+      API de Dados (que exige chave). O caminho responde 302 e o call_api devolve o link em
+      location, apontando para dadosabertos-download.cgu.gov.br; baixe o arquivo fora do gateway.
+      Ex.: GET /despesas-execucao/202510, /orcamento-despesa/2025, /transferencias/202510.
+      A página raiz /download-de-dados pode responder 405 (verificação anti-bot). Os arquivos
+      trazem nome e CPF parcial de pessoas físicas (favorecidos, servidores).
+    tags: [despesas, orcamento, transferencias, cgu, download]
+    notes: >-
+      Verificado em 2026-11-13 com HEAD: os três caminhos de exemplo responderam 302 com o link do
+      zip; um GET parcial (Range) do zip em dadosabertos-download.cgu.gov.br respondeu 206.
+
+  - id: inep-download
+    name: INEP — indicadores educacionais (download em massa)
+    provider: INEP
+    category: public
+    status: manual_only
+    auth: none
+    base_url: https://download.inep.gov.br
+    docs_url: https://www.gov.br/inep/pt-br/acesso-a-informacao/dados-abertos
+    description: >-
+      Não é API: arquivos xlsx e zip de indicadores educacionais (INSE, rendimento escolar). Os
+      links vêm das páginas de dados abertos do INEP. O servidor envia a cadeia TLS incompleta,
+      (falta o intermediário RNP ICPEdu GR46 OV TLS CA 2025, publicado pela GlobalSign no campo
+      AIA do certificado), então clientes que validam o certificado, como o do call_api, falham.
+      Não desligue a verificação: obtenha o intermediário pelo AIA do certificado, confira o
+      emissor e a impressão digital, junte-o às raízes do sistema num bundle e use esse bundle
+      (curl --cacert bundle.pem; Python: SSL_CERT_FILE ou verify=bundle.pem).
+      Ex.: /informacoes_estatisticas/indicadores_educacionais/2023/nivel_socioeconomico/INSE_2023_escolas.xlsx,
+      /informacoes_estatisticas/indicadores_educacionais/2025/tx_rend_escolas_2025.zip.
+    tags: [educacao, inep, escolas, inse, download]
+    notes: >-
+      Verificado em 2026-11-13: sem desligar a verificação, curl (rc 60) e httpx falham com
+      "unable to verify the first certificate"; o servidor envia só o certificado folha. O HEAD que
+      respondeu 200 (xlsx 8,8 MB e zip) foi feito com a verificação desligada, só para diagnóstico;
+      não foi refeito com o intermediário. Por isso manual_only: o esquema não tem campo para
+      download em massa nem para TLS incompleto.
+
+  - id: capes-dados-abertos
+    name: CAPES — Dados Abertos (CKAN)
+    provider: CAPES
+    category: public
+    status: available
+    auth: none
+    base_url: https://dadosabertos.capes.gov.br/api/3/action
+    docs_url: https://dadosabertos.capes.gov.br/
+    description: >-
+      Portal CKAN v3 da CAPES, sem chave: bolsas, programas, periódicos, teses e formação de
+      professores. Ex.: GET /package_list, /package_search?q=pibid,
+      /package_show?id=2018-a-2025-projetos-de-formacao-inicial-de-professores-da-educacao-basica.
+      Os recursos (campo url) são CSV, XLSX ou PDF em download direto, fora do base_url; o CSV usa ";"
+      e campos entre aspas (BOM UTF-8 no arquivo testado). Alguns conjuntos (bolsistas) trazem
+      nome de pessoas físicas.
+    tags: [educacao, pos-graduacao, pibid, capes, ckan]
+    notes: >-
+      Verificado em 2026-11-13 (package_list e package_show responderam 200).

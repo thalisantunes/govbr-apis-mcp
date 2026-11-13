@@ -47,6 +47,22 @@ def test_ids_unique_and_wellformed(catalog: Catalog):
         assert e.status in STATUSES, e.id
 
 
+def test_education_procurement_and_transfer_entries_load(catalog: Catalog):
+    expected = {
+        "pncp-consulta": "available",
+        "transferegov-ted": "available",
+        "capes-dados-abertos": "available",
+        "portal-transparencia-download": "available",
+        "inep-download": "manual_only",
+    }
+    for api_id, status in expected.items():
+        entry = catalog.get(api_id)
+        assert (entry.category, entry.auth, entry.status) == ("public", "none", status), api_id
+    assert catalog.get("transferegov-ted").openapi_url
+    assert catalog.get("portal-transparencia").auth == "api_key"
+    assert not catalog.get("inep-download").callable
+
+
 def test_callable_entries_have_base_url(catalog: Catalog):
     for e in catalog.list(status="available"):
         assert e.base_url, f"{e.id} is available but has no base_url"
