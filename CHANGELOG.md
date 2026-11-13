@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file. Versions follow
 
 ## [Unreleased]
 
-### Catalog
+### Spec fetch and catalog
 
 - Five new public entries, none needing a key: `pncp-consulta` (PNCP contracts, items and
   results), `transferegov-ted` (TED plans, credit notes and financial schedules, with its
@@ -13,11 +13,13 @@ All notable changes to this project are documented in this file. Versions follow
   Portal's bulk zips, distinct from the keyed API entry) and `inep-download` (INEP indicator
   files). The catalog now has 121 entries.
 - `inep-download` is `manual_only`: the schema has no field for bulk downloads, and the
-  server's incomplete TLS chain fails certificate validation in `call_api`.
+  server's incomplete TLS chain fails certificate validation in `call_api`. The entry says
+  how to fix it by supplying the missing intermediate, not by disabling verification.
 - `ibge-agregados` documents the `localidades` and `classificacao` syntax, the `|` period
   separator, the literal brackets and four useful tables (9514, 6579, 5938, 7342).
-- `ipeadata` documents that the server ignores `$filter` and `$top`, and that `NIVNOME`
-  mixes municipalities, states, regions and Brazil in one response.
+- `ipeadata` documents that the server ignores `$filter` and `$top`, that large series are
+  cut at `call_api`'s 60,000-character limit, and that `NIVNOME` mixes municipalities,
+  states, regions and Brazil in one response.
 
 ## [0.2.0] - 2026-10-19
 
