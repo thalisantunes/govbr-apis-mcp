@@ -25,6 +25,18 @@ apis:
     description: >-
       Séries estatísticas do IBGE (censos, PNAD, inflação, PIB municipal etc.) via
       agregados/variáveis/localidades. Ex.: GET /{agregado}/periodos/{periodo}/variaveis/{variavel}.
+      Query: localidades=N1[all] | N3[all] | N6[all] | N6[N3[51]] | N6[5103403] (N1 Brasil, N3 UF,
+      N6 município; N6[all] devolve ~3 MB); classificacao=2[6794]|287[93085,6572] (várias
+      classificações separadas por "|", categorias por ","); períodos separados por "|"
+      (2016|2017) ou -1 para o último; um intervalo como 2016-2025 falha se faltar algum ano.
+      Os colchetes devem ir literais ou como %5B/%5D, sem o cliente reinterpretá-los (no curl, use -g).
+      GET /{agregado}/metadados lista variáveis, classificações e níveis. Valores vêm como string
+      e "-", "X" ou "..." também; nomes de município vêm com sufixo " (UF)".
+      Tabelas úteis: 9514 (Censo 2022, população por idade; var 93; classificacao=287: 93085 = 10 a
+      14 anos, 6572/6573/6574 = 15/16/17 anos, 100362 = total; Brasil, UF e município), 6579
+      (população estimada, var 9324; períodos 2001 a 2026), 5938 (PIB municipal, var 37, mil R$,
+      até 2023; não há PIB per capita), 7342 (PNAD Contínua TIC, domicílios com internet por
+      conexão, só Brasil, região e UF).
     tags: [estatisticas, censo, sidra, ibge]
 
   - id: ibge-nomes
@@ -140,6 +152,10 @@ apis:
     description: >-
       Séries macroeconômicas, regionais e sociais do IPEA em OData.
       Ex.: GET /Metadados, /ValoresSerie(SERCODIGO='PRECOS12_IPCA12').
+      O servidor ignora $filter e $top (testados com TERCODIGO e VALDATA): a resposta é sempre a
+      série inteira (ex.: ~2,4 MB para ADH_IDHM), então filtre no cliente. A mesma resposta mistura
+      níveis, separados por NIVNOME (Municípios, Estados, Regiões, Brasil), e TERCODIGO é o código IBGE.
+      Séries sociais úteis: ADH_IDHM, ADH_T_FREQ6A14, ADH_T_FREQ15A17, ADH_T_ANALF15M.
     tags: [economia, series, ipea, odata]
 
   - id: inmet-tempo
