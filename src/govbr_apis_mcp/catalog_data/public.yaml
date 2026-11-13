@@ -205,3 +205,106 @@ apis:
       disponibilidade: CNPJ (Receita), CEP, feriados, taxas, bancos, DDD, FIPE.
       Ex.: GET /cnpj/v1/{cnpj}, /cep/v2/{cep}. Sem SLA; não usar para dado crítico.
     tags: [cnpj, cep, feriados, comunidade]
+
+  - id: pncp-consulta
+    name: PNCP — Consulta de contratações, itens e resultados
+    provider: Ministério da Gestão e da Inovação (PNCP)
+    category: public
+    status: available
+    auth: none
+    base_url: https://pncp.gov.br/api
+    docs_url: https://pncp.gov.br/api/consulta/swagger-ui/index.html
+    description: >-
+      Portal Nacional de Contratações Públicas (Lei 14.133): contratações, itens e resultados.
+      A consulta documentada exige dataInicial, dataFinal (AAAAMMDD) e codigoModalidadeContratacao.
+      Ex.: GET /consulta/v1/contratacoes/publicacao?dataInicial=20260101&dataFinal=20260110&codigoModalidadeContratacao=8&pagina=1&tamanhoPagina=10 (tamanhoPagina mínimo 10).
+      Itens e resultados de uma compra: GET /pncp/v1/orgaos/{cnpj}/compras/{ano}/{sequencial}/itens
+      (10 por página por padrão; use tamanhoPagina=50) e .../itens/{numeroItem}/resultados. Busca textual, não documentada:
+      GET /search/?q=laboratorio+maker&tipos_documento=edital&pagina=1&tam_pagina=20&status=todos
+      (aspas na consulta podem derrubar a conexão). Fornecedor MEI vem como pessoa jurídica com
+      nome de pessoa física: cuidado com dado pessoal.
+    tags: [compras, licitacoes, contratacoes, pncp]
+    notes: >-
+      Verificado em 2026-11-13 (contratações, itens, resultados e /search/ responderam 200).
+      O spec (/consulta/v3/api-docs) tem paths relativos a /api/consulta, por isso não há
+      openapi_url: não casaria com este base_url.
+
+  - id: transferegov-ted
+    name: Transferegov — Termos de Execução Descentralizada (TED)
+    provider: Ministério da Gestão e da Inovação (Transferegov)
+    category: public
+    status: available
+    auth: none
+    base_url: https://api.transferegov.gestao.gov.br/ted
+    openapi_url: https://api.transferegov.gestao.gov.br/ted/
+    docs_url: https://api.transferegov.gestao.gov.br/ted/
+    description: >-
+      Dados abertos de TED (PostgREST, sem chave): programa, plano_acao, plano_acao_meta,
+      nota_credito, programacao_financeira e outras tabelas listadas no spec. Filtros no estilo
+      PostgREST: ?campo=eq.X, ilike.*txt*, in.(a,b), gte.2024, select=a,b, limit=, offset=.
+      Ex.: GET /plano_acao?limit=1, /nota_credito?tx_observacao_nota=ilike.*2263/25*.
+      nota_credito.tx_observacao_nota traz o número interno do TED ("TED ref.: 2263/25"), elo
+      entre essa numeração e id_plano_acao. Colunas usam prefixos (tx_, vl_, dt_, id_). Chamadas
+      com vários filtros podem demorar mais de 60 s.
+    tags: [transferencias, ted, planos-de-acao, notas-de-credito]
+    notes: >-
+      Verificado em 2026-11-13 (plano_acao, nota_credito, programacao_financeira e programa
+      responderam 200). A raiz devolve o spec Swagger 2.0.
+
+  - id: portal-transparencia-download
+    name: Portal da Transparência — downloads em massa
+    provider: CGU
+    category: public
+    status: available
+    auth: none
+    base_url: https://portaldatransparencia.gov.br/download-de-dados
+    docs_url: https://portaldatransparencia.gov.br/download-de-dados
+    description: >-
+      Arquivos zip (CSV em latin1, separador ";", decimal com vírgula) sem chave, distintos da
+      API de Dados (que exige chave). O caminho responde 302 e o call_api devolve o link em
+      location, apontando para dadosabertos-download.cgu.gov.br; baixe o arquivo fora do gateway.
+      Ex.: GET /despesas-execucao/202510, /orcamento-despesa/2025, /transferencias/202510.
+      A página raiz /download-de-dados pode responder 405 (verificação anti-bot).
+    tags: [despesas, orcamento, transferencias, cgu, download]
+    notes: >-
+      Verificado em 2026-11-13 com HEAD: os três caminhos de exemplo responderam 302 com o link do
+      zip; um GET parcial (Range) do zip em dadosabertos-download.cgu.gov.br respondeu 206.
+
+  - id: inep-download
+    name: INEP — indicadores educacionais (download em massa)
+    provider: INEP
+    category: public
+    status: manual_only
+    auth: none
+    base_url: https://download.inep.gov.br
+    docs_url: https://www.gov.br/inep/pt-br/acesso-a-informacao/dados-abertos
+    description: >-
+      Não é API: arquivos xlsx e zip de indicadores educacionais (INSE, rendimento escolar). Os
+      links vêm das páginas de dados abertos do INEP. O servidor envia a cadeia TLS incompleta,
+      então clientes que validam o certificado (como o do call_api) falham; baixe com curl -k
+      ou instale o certificado intermediário.
+      Ex.: /informacoes_estatisticas/indicadores_educacionais/2023/nivel_socioeconomico/INSE_2023_escolas.xlsx,
+      /informacoes_estatisticas/indicadores_educacionais/2025/tx_rend_escolas_2025.zip.
+    tags: [educacao, inep, escolas, inse, download]
+    notes: >-
+      Verificado em 2026-11-13: HEAD com curl -k respondeu 200 (xlsx 8,8 MB e zip); sem -k, curl e
+      httpx falham com "unable to get local issuer certificate". Por isso manual_only: o esquema não
+      tem campo para download em massa nem para TLS incompleto.
+
+  - id: capes-dados-abertos
+    name: CAPES — Dados Abertos (CKAN)
+    provider: CAPES
+    category: public
+    status: available
+    auth: none
+    base_url: https://dadosabertos.capes.gov.br/api/3/action
+    docs_url: https://dadosabertos.capes.gov.br/
+    description: >-
+      Portal CKAN v3 da CAPES, sem chave: bolsas, programas, periódicos, teses e formação de
+      professores. Ex.: GET /package_list, /package_search?q=pibid,
+      /package_show?id=2018-a-2025-projetos-de-formacao-inicial-de-professores-da-educacao-basica.
+      Os recursos (campo url) são CSV, XLSX ou PDF em download direto, fora do base_url; o CSV usa ";"
+      e campos entre aspas (BOM UTF-8 no arquivo testado).
+    tags: [educacao, pos-graduacao, pibid, capes, ckan]
+    notes: >-
+      Verificado em 2026-11-13 (package_list e package_show responderam 200).
